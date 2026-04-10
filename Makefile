@@ -1,5 +1,5 @@
 CC     ?= cc
-CFLAGS ?= -Wall -Wextra -Wpedantic -O2 -std=c11
+CFLAGS ?= -Wall -Wextra -Wpedantic -O2 -std=c11 -D_POSIX_C_SOURCE=200809L -D_DARWIN_C_SOURCE
 
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
