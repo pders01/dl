@@ -493,10 +493,19 @@ static int entry_cmp_type(const void *a, const void *b)
 /* ── directory scanning ────────────────────────────────────────── */
 
 /*
- * Count children and compute subtree size.
+ * Count immediate children and compute recursive subtree size.
+ *
+ * Honors `ignored_dirs`: ignored subdirectories still count toward
+ * the parent's `ndirs` (so "5 dirs" means what you see), but their
+ * contents are NOT walked and their size is NOT added. Without this,
+ * a single nested node_modules dominates every scan.
+ *
+ * Used only for directories we will NOT emit rows for — i.e. past
+ * max_depth. Within max_depth, `collect` recurses and reuses the
+ * stats it computes, avoiding a second walk of the same subtree.
  */
-static void scan_children(int parent_fd, const char *name,
-                          int *nfiles, int *ndirs, off_t *total_size)
+static void scan_stats(int parent_fd, const char *name,
+                       int *nfiles, int *ndirs, off_t *total_size)
 {
 	*nfiles = 0;
 	*ndirs = 0;
@@ -516,31 +525,45 @@ static void scan_children(int parent_fd, const char *name,
 			continue;
 
 		struct stat st;
-		if (fstatat(fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0) {
-			if (S_ISDIR(st.st_mode)) {
-				(*ndirs)++;
-				/* recurse for subtree size */
-				int sub_nf, sub_nd;
-				off_t sub_sz;
-				scan_children(fd, de->d_name,
-				              &sub_nf, &sub_nd, &sub_sz);
-				*total_size += sub_sz;
-			} else {
-				(*nfiles)++;
-				*total_size += st.st_size;
-			}
+		if (fstatat(fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+			continue;
+
+		if (S_ISDIR(st.st_mode)) {
+			(*ndirs)++;
+			if (is_ignored(de->d_name))
+				continue;
+			int sub_nf, sub_nd;
+			off_t sub_sz;
+			scan_stats(fd, de->d_name,
+			           &sub_nf, &sub_nd, &sub_sz);
+			*total_size += sub_sz;
+		} else {
+			(*nfiles)++;
+			*total_size += st.st_size;
 		}
 	}
 
 	closedir(d);
 }
 
+/*
+ * Recursively scan `dirname`, appending rows to `rl` for every entry
+ * within `max_depth`. Returns the immediate file/dir counts and the
+ * recursive total byte size via out params, so callers that already
+ * recursed don't need a second walk to produce those numbers.
+ */
 static void collect(int parent_fd, const char *dirname,
                     int depth, int max_depth,
                     const options_t *opts,
                     rowlist_t *rl,
-                    const char *relpath)  /* path relative to start dir */
+                    const char *relpath,  /* path relative to start dir */
+                    int *out_nfiles, int *out_ndirs, off_t *out_size)
 {
+	*out_nfiles = 0;
+	*out_ndirs = 0;
+	*out_size = 0;
+
+
 	int fd = openat(parent_fd, dirname, O_RDONLY | O_DIRECTORY);
 	if (fd < 0) {
 		fprintf(stderr, "dl: %s: %s\n", dirname, strerror(errno));
@@ -591,13 +614,8 @@ static void collect(int parent_fd, const char *dirname,
 
 		e->type = classify(de->d_name, e->is_dir);
 
-		if (e->is_dir) {
+		if (e->is_dir)
 			e->is_ignored = is_ignored(de->d_name);
-			if (!e->is_ignored)
-				scan_children(fd2, de->d_name,
-				              &e->nfiles, &e->ndirs,
-				              &e->subtree_size);
-		}
 
 		n++;
 	}
@@ -611,6 +629,7 @@ static void collect(int parent_fd, const char *dirname,
 
 	for (int i = 0; i < n; i++) {
 		entry_t *e = &entries[i];
+		int row_idx = rl->count;
 		row_t *r = rowlist_add(rl);
 
 		r->depth = opts->flat ? 0 : depth;
@@ -642,36 +661,18 @@ static void collect(int parent_fd, const char *dirname,
 			                        "%s", own);
 		}
 
-		/* col_a: files count OR size */
-		if (e->is_dir) {
-			if (e->is_ignored) {
-				r->col_a_len = snprintf(r->col_a,
-				                        sizeof(r->col_a),
-				                        "ignored");
-			} else if (e->nfiles > 0) {
-				r->col_a_len = snprintf(r->col_a,
-				                        sizeof(r->col_a),
-				                        "%d files", e->nfiles);
-			}
-		} else {
+		/* file col_a = size (directory columns are filled below,
+		 * after we know the subtree stats). */
+		if (!e->is_dir) {
 			fmt_size(e->size, r->col_a, sizeof(r->col_a));
 			r->col_a_len = (int)strlen(r->col_a);
+			(*out_nfiles)++;
+			(*out_size) += e->size;
 		}
 
-		/* col_b: dirs count */
-		if (e->is_dir && !e->is_ignored && e->ndirs > 0) {
-			r->col_b_len = snprintf(r->col_b, sizeof(r->col_b),
-			                        "%d dirs", e->ndirs);
-		} else if (e->is_link && e->link_target[0]) {
+		if (e->is_link && e->link_target[0]) {
 			r->col_b_len = snprintf(r->col_b, sizeof(r->col_b),
 			                        "-> %s", e->link_target);
-		}
-
-		/* subtree size for dirs */
-		if (e->is_dir && !e->is_ignored && e->subtree_size > 0) {
-			fmt_size(e->subtree_size, r->col_size,
-			         sizeof(r->col_size));
-			r->col_size_len = (int)strlen(r->col_size);
 		}
 
 		/* git status */
@@ -698,9 +699,28 @@ static void collect(int parent_fd, const char *dirname,
 			r->time_len = (int)strlen(r->time);
 		}
 
-		/* recurse (skip in flat mode) */
-		if (!opts->flat && e->is_dir && !e->is_ignored &&
-		    depth + 1 < max_depth) {
+		if (!e->is_dir)
+			continue;
+
+		(*out_ndirs)++;
+
+		if (e->is_ignored) {
+			/* r may be stale after earlier rowlist_add calls in
+			 * the loop — but no recursion has happened for this
+			 * entry yet, so `r` is still valid here. */
+			r->col_a_len = snprintf(r->col_a, sizeof(r->col_a),
+			                        "ignored");
+			continue;
+		}
+
+		/* Compute the directory's stats. Either we recurse (emitting
+		 * rows for its contents and getting the stats for free) or we
+		 * fall back to scan_stats for dirs past max_depth. This is the
+		 * whole point of the refactor: no subtree is walked twice. */
+		int sub_nf = 0, sub_nd = 0;
+		off_t sub_sz = 0;
+
+		if (!opts->flat && depth + 1 < max_depth) {
 			char child_relpath[1024];
 			if (relpath[0])
 				snprintf(child_relpath, sizeof(child_relpath),
@@ -710,8 +730,30 @@ static void collect(int parent_fd, const char *dirname,
 				         "%s", e->name);
 
 			collect(fd2, e->name, depth + 1, max_depth,
-			        opts, rl, child_relpath);
+			        opts, rl, child_relpath,
+			        &sub_nf, &sub_nd, &sub_sz);
+		} else {
+			scan_stats(fd2, e->name, &sub_nf, &sub_nd, &sub_sz);
 		}
+
+		/* Re-fetch the row pointer — recursive collect calls may
+		 * have realloc'd rl->rows, invalidating the earlier `r`. */
+		r = &rl->rows[row_idx];
+
+		if (sub_nf > 0) {
+			r->col_a_len = snprintf(r->col_a, sizeof(r->col_a),
+			                        "%d files", sub_nf);
+		}
+		if (sub_nd > 0) {
+			r->col_b_len = snprintf(r->col_b, sizeof(r->col_b),
+			                        "%d dirs", sub_nd);
+		}
+		if (sub_sz > 0) {
+			fmt_size(sub_sz, r->col_size, sizeof(r->col_size));
+			r->col_size_len = (int)strlen(r->col_size);
+		}
+
+		(*out_size) += sub_sz;
 	}
 
 	free(entries);
@@ -935,8 +977,12 @@ int main(int argc, char **argv)
 	rowlist_t rl;
 	rowlist_init(&rl);
 
+	int root_nf, root_nd;
+	off_t root_sz;
+
 	if (argc == 0) {
-		collect(AT_FDCWD, ".", 0, opts.depth, &opts, &rl, "");
+		collect(AT_FDCWD, ".", 0, opts.depth, &opts, &rl, "",
+		        &root_nf, &root_nd, &root_sz);
 	} else {
 		for (int i = 0; i < argc; i++) {
 			if (argc > 1)
@@ -948,7 +994,8 @@ int main(int argc, char **argv)
 				        argv[i], strerror(errno));
 				continue;
 			}
-			collect(fd, ".", 0, opts.depth, &opts, &rl, "");
+			collect(fd, ".", 0, opts.depth, &opts, &rl, "",
+			        &root_nf, &root_nd, &root_sz);
 			close(fd);
 		}
 	}
