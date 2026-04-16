@@ -770,6 +770,14 @@ static int get_term_height(void)
 	return 24; /* fallback */
 }
 
+static int get_term_width(void)
+{
+	struct winsize ws;
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+		return ws.ws_col;
+	return 80; /* fallback */
+}
+
 /*
  * Tab-separated output for piping.
  * Fields: name, perms, owner, git, files_or_size, dirs, subtree_size, time
@@ -819,6 +827,27 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts)
 		if (r->col_size_len > w_col_size) w_col_size = r->col_size_len;
 		if (r->git_len > w_git) w_git = r->git_len;
 		if (r->time_len > w_time) w_time = r->time_len;
+	}
+
+	/*
+	 * Cap w_col_b to the terminal width. col_b holds "N dirs" (short)
+	 * or "-> <symlink target>" (potentially unbounded). A single long
+	 * symlink target would otherwise widen every row past the viewport
+	 * and wrap the whole layout.
+	 */
+	if (w_col_b > 0) {
+		int term_w = get_term_width();
+		int fixed = w_name + 2 + 10; /* two spaces + perms */
+		if (w_owner > 0) fixed += 2 + w_owner;
+		if (opts->show_git)
+			fixed += (w_git > 0) ? 2 + w_git : 3;
+		fixed += 2 + w_col_a;
+		if (w_col_size > 0) fixed += 2 + w_col_size;
+		fixed += 2 + w_time + 4; /* two spaces + time + " ago" */
+
+		int budget = term_w - fixed - 2; /* 2 for leading "  " */
+		if (budget < 4) budget = 4;
+		if (w_col_b > budget) w_col_b = budget;
 	}
 
 	/* decide whether to page */
@@ -893,9 +922,16 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts)
 		/* col_a: files count or size */
 		fprintf(out, "  %*s", w_col_a, r->col_a);
 
-		/* col_b: dirs count */
-		if (w_col_b > 0)
-			fprintf(out, "  %*s", w_col_b, r->col_b);
+		/* col_b: dirs count, or truncated symlink target */
+		if (w_col_b > 0) {
+			if (r->col_b_len <= w_col_b)
+				fprintf(out, "  %*s", w_col_b, r->col_b);
+			else if (w_col_b >= 3)
+				fprintf(out, "  %.*s...",
+				        w_col_b - 3, r->col_b);
+			else
+				fprintf(out, "  %.*s", w_col_b, "...");
+		}
 
 		/* subtree size for dirs */
 		if (w_col_size > 0)
