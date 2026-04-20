@@ -802,6 +802,20 @@ static void print_tsv(const rowlist_t *rl, const options_t *opts)
 	}
 }
 
+/*
+ * Print col_b honoring width budget: right-align if fits, else truncate
+ * with "..." suffix. Leading two spaces are the column separator.
+ */
+static void print_col_b(FILE *out, const row_t *r, int budget)
+{
+	if (r->col_b_len <= budget)
+		fprintf(out, "  %*s", budget, r->col_b);
+	else if (budget >= 3)
+		fprintf(out, "  %.*s...", budget - 3, r->col_b);
+	else
+		fprintf(out, "  %.*s", budget, "...");
+}
+
 static void print_pretty(const rowlist_t *rl, const options_t *opts)
 {
 	if (rl->count == 0) return;
@@ -816,6 +830,7 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts)
 	int w_col_size = 0;
 	int w_git = 0;
 	int w_time = 0;
+	int max_depth_seen = 0;
 
 	for (int i = 0; i < rl->count; i++) {
 		const row_t *r = &rl->rows[i];
@@ -827,34 +842,55 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts)
 		if (r->col_size_len > w_col_size) w_col_size = r->col_size_len;
 		if (r->git_len > w_git) w_git = r->git_len;
 		if (r->time_len > w_time) w_time = r->time_len;
+		if (r->depth > max_depth_seen) max_depth_seen = r->depth;
 	}
 
 	/*
-	 * Cap w_col_b to the terminal width. col_b holds "N dirs" (short)
-	 * or "-> <symlink target>" (potentially unbounded). A single long
-	 * symlink target would otherwise widen every row past the viewport
-	 * and wrap the whole layout.
+	 * Metadata-only width (everything after the name column, minus col_b).
+	 * Reused for single-line col_b budget and two-line layout decision.
+	 */
+	int meta_fixed = 2 + 10; /* two spaces + perms */
+	if (w_owner > 0) meta_fixed += 2 + w_owner;
+	if (opts->show_git)
+		meta_fixed += (w_git > 0) ? 2 + w_git : 3;
+	meta_fixed += 2 + w_col_a;
+	if (w_col_size > 0) meta_fixed += 2 + w_col_size;
+	meta_fixed += 2 + w_time + 4; /* two spaces + time + " ago" */
+
+	int term_w = get_term_width();
+
+	/*
+	 * Adaptive layout: fall back to two-line rendering when a single row
+	 * would overflow the terminal. Content-aware — no fixed threshold.
+	 */
+	int single_required = w_name + meta_fixed;
+	if (w_col_b > 0) single_required += 2 + w_col_b;
+	int two_line = single_required > term_w;
+
+	/*
+	 * Cap w_col_b to available budget in the active layout. col_b can
+	 * hold "-> <symlink>" which is unbounded and would otherwise wrap.
 	 */
 	if (w_col_b > 0) {
-		int term_w = get_term_width();
-		int fixed = w_name + 2 + 10; /* two spaces + perms */
-		if (w_owner > 0) fixed += 2 + w_owner;
-		if (opts->show_git)
-			fixed += (w_git > 0) ? 2 + w_git : 3;
-		fixed += 2 + w_col_a;
-		if (w_col_size > 0) fixed += 2 + w_col_size;
-		fixed += 2 + w_time + 4; /* two spaces + time + " ago" */
-
-		int budget = term_w - fixed - 2; /* 2 for leading "  " */
+		int prefix;
+		if (two_line) {
+			/* line 2: tree continuation (4 cols per level) or 2-col indent */
+			prefix = (opts->flat || max_depth_seen == 0)
+			       ? 2 : max_depth_seen * 4;
+		} else {
+			prefix = w_name;
+		}
+		int budget = term_w - prefix - meta_fixed - 2; /* 2 = col_b separator */
 		if (budget < 4) budget = 4;
 		if (w_col_b > budget) w_col_b = budget;
 	}
 
-	/* decide whether to page */
+	/* decide whether to page (two-line doubles effective row count) */
 	FILE *out = stdout;
 	FILE *pager = NULL;
 
-	if (rl->count > get_term_height()) {
+	int effective_rows = two_line ? rl->count * 2 : rl->count;
+	if (effective_rows > get_term_height()) {
 		const char *pager_cmd = getenv("PAGER");
 		if (!pager_cmd || !pager_cmd[0])
 			pager_cmd = "less -R";
@@ -869,6 +905,29 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts)
 	/* print */
 	int tree_continues[MAX_DEPTH] = {0};
 	enum ftype last_type = FT_COUNT; /* sentinel */
+
+	/* line-2 prefix width when two_line is active (aligns metadata across rows) */
+	int line2_prefix_w = (opts->flat || max_depth_seen == 0)
+	                   ? 2 : max_depth_seen * 4;
+
+	/*
+	 * Right-align the time column to the terminal edge. Without this,
+	 * leaf rows (no col_b, no col_size) leave a gap where the reserved
+	 * slots stay empty, pushing the time column oddly inward.
+	 */
+	int meta_content = 10; /* perms */
+	if (w_owner > 0) meta_content += 2 + w_owner;
+	if (opts->show_git)
+		meta_content += (w_git > 0) ? 2 + w_git : 3;
+	meta_content += 2 + w_col_a;
+	if (w_col_b > 0) meta_content += 2 + w_col_b;
+	if (w_col_size > 0) meta_content += 2 + w_col_size;
+
+	int time_field = 2 + w_time + 4; /* "  " + time + " ago" */
+	int single_time_pad = term_w - w_name - meta_content - time_field;
+	int two_time_pad = term_w - line2_prefix_w - meta_content - time_field;
+	if (single_time_pad < 0) single_time_pad = 0;
+	if (two_time_pad < 0) two_time_pad = 0;
 
 	for (int i = 0; i < rl->count; i++) {
 		const row_t *r = &rl->rows[i];
@@ -886,7 +945,7 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts)
 			if (r->depth > 0)
 				tree_continues[r->depth - 1] = !r->is_last;
 
-			/* tree prefix */
+			/* tree prefix on line 1 */
 			for (int d = 0; d < r->depth; d++) {
 				if (d == r->depth - 1)
 					fprintf(out, "%s ",
@@ -898,6 +957,51 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts)
 		}
 
 		int indent_cols = opts->flat ? 0 : INDENT_COLS(r->depth);
+
+		if (two_line) {
+			/* line 1: name only (allowed to use remaining width) */
+			fprintf(out, "%s\n", r->name);
+
+			/* line 2: tree continuation + metadata */
+			int written = 0;
+			if (opts->flat || r->depth == 0) {
+				fprintf(out, "  ");
+				written = 2;
+			} else {
+				for (int d = 0; d < r->depth; d++) {
+					fprintf(out, "%s   ",
+					        tree_continues[d] ? "│" : " ");
+					written += 4;
+				}
+			}
+			/* pad to uniform line2_prefix_w so metadata aligns */
+			if (written < line2_prefix_w)
+				fprintf(out, "%*s", line2_prefix_w - written, "");
+
+			fprintf(out, "%s", r->perms);
+			if (w_owner > 0)
+				fprintf(out, "  %-*s", w_owner, r->owner);
+			if (opts->show_git) {
+				if (w_git > 0)
+					fprintf(out, "  %*s", w_git, r->git);
+				else
+					fprintf(out, "   ");
+			}
+			fprintf(out, "  %*s", w_col_a, r->col_a);
+			if (w_col_b > 0)
+				print_col_b(out, r, w_col_b);
+			if (w_col_size > 0)
+				fprintf(out, "  %*s", w_col_size, r->col_size);
+			if (r->is_ignored)
+				fprintf(out, "\n");
+			else
+				fprintf(out, "%*s  %*s ago\n",
+				        two_time_pad, "", w_time, r->time);
+
+			continue;
+		}
+
+		/* single-line layout */
 
 		/* name */
 		int name_pad = w_name - indent_cols - r->name_len;
@@ -923,15 +1027,8 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts)
 		fprintf(out, "  %*s", w_col_a, r->col_a);
 
 		/* col_b: dirs count, or truncated symlink target */
-		if (w_col_b > 0) {
-			if (r->col_b_len <= w_col_b)
-				fprintf(out, "  %*s", w_col_b, r->col_b);
-			else if (w_col_b >= 3)
-				fprintf(out, "  %.*s...",
-				        w_col_b - 3, r->col_b);
-			else
-				fprintf(out, "  %.*s", w_col_b, "...");
-		}
+		if (w_col_b > 0)
+			print_col_b(out, r, w_col_b);
 
 		/* subtree size for dirs */
 		if (w_col_size > 0)
@@ -941,7 +1038,8 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts)
 		if (r->is_ignored)
 			fprintf(out, "\n");
 		else
-			fprintf(out, "  %*s ago\n", w_time, r->time);
+			fprintf(out, "%*s  %*s ago\n",
+			        single_time_pad, "", w_time, r->time);
 	}
 
 	if (pager)
