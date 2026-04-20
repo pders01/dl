@@ -924,7 +924,9 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts)
 	if (w_col_size > 0) meta_content += 2 + w_col_size;
 
 	int time_field = 2 + w_time + 4; /* "  " + time + " ago" */
-	int single_time_pad = term_w - w_name - meta_content - time_field;
+	/* single-line writes "  " before perms; meta_content starts at perms (10),
+	 * so subtract that separator here or the row overflows by 2 cols. */
+	int single_time_pad = term_w - w_name - 2 - meta_content - time_field;
 	int two_time_pad = term_w - line2_prefix_w - meta_content - time_field;
 	if (single_time_pad < 0) single_time_pad = 0;
 	if (two_time_pad < 0) two_time_pad = 0;
