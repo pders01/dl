@@ -704,6 +704,8 @@ static row_t *rowlist_add(rowlist_t *rl) {
 
 static void rowlist_free(rowlist_t *rl) { free(rl->rows); }
 
+static void rowlist_reset(rowlist_t *rl) { rl->count = 0; }
+
 /* ── entry sorting ─────────────────────────────────────────────── */
 
 typedef struct {
@@ -1493,11 +1495,9 @@ int main(int argc, char **argv) {
       gitignore_init(".");
     collect(AT_FDCWD, ".", 0, opts.depth, &opts, &rl, "", &root_nf, &root_nd,
             &root_sz);
+    print_all(&rl, &opts);
   } else {
     for (int i = 0; i < argc; i++) {
-      if (argc > 1)
-        printf("%s:\n", argv[i]);
-
       int fd = open(argv[i], O_RDONLY | O_DIRECTORY);
       if (fd < 0) {
         fprintf(stderr, "dl: %s: %s\n", argv[i], strerror(errno));
@@ -1508,13 +1508,21 @@ int main(int argc, char **argv) {
         git_map_init(argv[i]);
       if (opts.use_gitignore)
         gitignore_init(argv[i]);
+
+      rowlist_reset(&rl);
       collect(fd, ".", 0, opts.depth, &opts, &rl, "", &root_nf, &root_nd,
               &root_sz);
       close(fd);
+
+      if (argc > 1) {
+        if (i > 0)
+          printf("\n");
+        printf("%s:\n", argv[i]);
+      }
+      print_all(&rl, &opts);
     }
   }
 
-  print_all(&rl, &opts);
   rowlist_free(&rl);
 
   return 0;
