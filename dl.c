@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <locale.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
@@ -22,6 +23,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <wchar.h>
 
 /* ── configuration ─────────────────────────────────────────────── */
 
@@ -301,11 +303,60 @@ static void fmt_reltime(time_t mtime, char *buf, size_t bufsz) {
     snprintf(buf, bufsz, "%ldy", diff / (86400 * 365));
 }
 
-/* clamp snprintf return value to chars actually stored (cap-1 on overflow) */
-static int sn_stored_len(int n, size_t cap) {
-  if (n < 0)
-    return 0;
-  return (size_t)n >= cap ? (int)cap - 1 : n;
+/* terminal display width of a UTF-8 string, treating non-printables as 0 cols
+ * and decoding errors as 1 col. Requires locale set for LC_CTYPE. */
+static int display_width(const char *s) {
+  mbstate_t st;
+  memset(&st, 0, sizeof(st));
+  int total = 0;
+  while (*s) {
+    wchar_t wc;
+    size_t n = mbrtowc(&wc, s, MB_CUR_MAX, &st);
+    if (n == 0)
+      break;
+    if (n == (size_t)-1 || n == (size_t)-2) {
+      total++;
+      s++;
+      memset(&st, 0, sizeof(st));
+      continue;
+    }
+    int w = wcwidth(wc);
+    if (w < 0)
+      w = 0;
+    total += w;
+    s += n;
+  }
+  return total;
+}
+
+/* return number of bytes from `s` whose display width sums to <= cols. */
+static int bytes_for_display_cols(const char *s, int cols) {
+  mbstate_t st;
+  memset(&st, 0, sizeof(st));
+  const char *p = s;
+  int used = 0;
+  while (*p) {
+    wchar_t wc;
+    size_t n = mbrtowc(&wc, p, MB_CUR_MAX, &st);
+    if (n == 0)
+      break;
+    if (n == (size_t)-1 || n == (size_t)-2) {
+      if (used + 1 > cols)
+        break;
+      used++;
+      p++;
+      memset(&st, 0, sizeof(st));
+      continue;
+    }
+    int w = wcwidth(wc);
+    if (w < 0)
+      w = 0;
+    if (used + w > cols)
+      break;
+    used += w;
+    p += n;
+  }
+  return (int)(p - s);
 }
 
 static void fmt_perms(mode_t mode, char *buf) {
@@ -922,13 +973,14 @@ static void collect(int parent_fd, const char *dirname, int depth,
 
     /* name with type suffix */
     if (e->is_dir)
-      r->name_len = snprintf(r->name, sizeof(r->name), "%s/", e->name);
+      snprintf(r->name, sizeof(r->name), "%s/", e->name);
     else if (e->is_link)
-      r->name_len = snprintf(r->name, sizeof(r->name), "%s@", e->name);
+      snprintf(r->name, sizeof(r->name), "%s@", e->name);
     else if (e->mode & S_IXUSR)
-      r->name_len = snprintf(r->name, sizeof(r->name), "%s*", e->name);
+      snprintf(r->name, sizeof(r->name), "%s*", e->name);
     else
-      r->name_len = snprintf(r->name, sizeof(r->name), "%s", e->name);
+      snprintf(r->name, sizeof(r->name), "%s", e->name);
+    r->name_len = display_width(r->name);
 
     /* permissions */
     fmt_perms(e->mode, r->perms);
@@ -936,7 +988,8 @@ static void collect(int parent_fd, const char *dirname, int depth,
     /* owner (only if different from current user) */
     const char *own = owner_name(e->uid);
     if (own) {
-      r->owner_len = snprintf(r->owner, sizeof(r->owner), "%s", own);
+      snprintf(r->owner, sizeof(r->owner), "%s", own);
+      r->owner_len = display_width(r->owner);
     }
 
     /* file col_a = size (directory columns are filled below,
@@ -949,8 +1002,8 @@ static void collect(int parent_fd, const char *dirname, int depth,
     }
 
     if (e->is_link && e->link_target[0]) {
-      int n = snprintf(r->col_b, sizeof(r->col_b), "-> %s", e->link_target);
-      r->col_b_len = sn_stored_len(n, sizeof(r->col_b));
+      snprintf(r->col_b, sizeof(r->col_b), "-> %s", e->link_target);
+      r->col_b_len = display_width(r->col_b);
     }
 
     /* git status */
@@ -1018,8 +1071,8 @@ static void collect(int parent_fd, const char *dirname, int depth,
       r->col_a_len = snprintf(r->col_a, sizeof(r->col_a), "%d files", sub_nf);
     }
     if (sub_nd > 0) {
-      int n = snprintf(r->col_b, sizeof(r->col_b), "%d dirs", sub_nd);
-      r->col_b_len = sn_stored_len(n, sizeof(r->col_b));
+      snprintf(r->col_b, sizeof(r->col_b), "%d dirs", sub_nd);
+      r->col_b_len = display_width(r->col_b);
     }
     if (sub_sz > 0) {
       fmt_size(sub_sz, r->col_size, sizeof(r->col_size));
@@ -1044,8 +1097,8 @@ static void collect(int parent_fd, const char *dirname, int depth,
 
         char subj[512];
         if (git_repo_subject(fullpath, subj, sizeof(subj))) {
-          int n = snprintf(r->col_b, sizeof(r->col_b), "%s", subj);
-          r->col_b_len = sn_stored_len(n, sizeof(r->col_b));
+          snprintf(r->col_b, sizeof(r->col_b), "%s", subj);
+          r->col_b_len = display_width(r->col_b);
         }
       }
     }
@@ -1095,16 +1148,21 @@ static void print_tsv(const rowlist_t *rl, const options_t *opts) {
 }
 
 /*
- * Print col_b honoring width budget: right-align if fits, else truncate
- * with "..." suffix. Leading two spaces are the column separator.
+ * Print col_b honoring width budget in display columns. Right-align when
+ * it fits, else truncate with "..." suffix. Leading two spaces are the
+ * column separator. Display-width-aware so multi-byte runes (em-dash,
+ * CJK) align correctly with neighbouring rows.
  */
 static void print_col_b(FILE *out, const row_t *r, int budget) {
-  if (r->col_b_len <= budget)
-    fprintf(out, "  %*s", budget, r->col_b);
-  else if (budget >= 3)
-    fprintf(out, "  %.*s...", budget - 3, r->col_b);
-  else
+  if (r->col_b_len <= budget) {
+    int pad = budget - r->col_b_len;
+    fprintf(out, "  %*s%s", pad, "", r->col_b);
+  } else if (budget >= 3) {
+    int nbytes = bytes_for_display_cols(r->col_b, budget - 3);
+    fprintf(out, "  %.*s...", nbytes, r->col_b);
+  } else {
     fprintf(out, "  %.*s", budget, "...");
+  }
 }
 
 static void print_git_banner(FILE *out) {
@@ -1355,7 +1413,7 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
 
       fprintf(out, "%s", r->perms);
       if (w_owner > 0)
-        fprintf(out, "  %-*s", w_owner, r->owner);
+        fprintf(out, "  %s%*s", r->owner, w_owner - r->owner_len, "");
       if (opts->show_git) {
         if (w_git > 0)
           fprintf(out, "  %*s", w_git, r->git);
@@ -1448,6 +1506,8 @@ static void usage(int code) {
 }
 
 int main(int argc, char **argv) {
+  setlocale(LC_CTYPE, "");
+
   options_t opts = {
       .depth = DEFAULT_DEPTH,
       .show_all = 0,
