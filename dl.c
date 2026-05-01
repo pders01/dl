@@ -25,469 +25,460 @@
 
 /* ── configuration ─────────────────────────────────────────────── */
 
-#define DEFAULT_DEPTH    2
-#define MAX_DEPTH       64
-#define INITIAL_ROWS  1024
-#define GIT_MAP_SIZE  4096
+#define DEFAULT_DEPTH 2
+#define MAX_DEPTH 64
+#define INITIAL_ROWS 1024
+#define GIT_MAP_SIZE 4096
 
 /* Hardcoded ignore list — always collapsed/hidden */
 static const char *ignored_dirs[] = {
-	".git", "node_modules", "__pycache__", ".tox", ".mypy_cache",
-	".pytest_cache", ".venv", "venv", ".eggs", "*.egg-info",
-	".next", ".nuxt", ".output", "dist", "build", ".cache",
-	".parcel-cache", ".turbo", "target",       /* rust */
-	"_build",                                   /* elixir/erlang */
-	"deps",                                     /* elixir mix */
-	".zig-cache", "zig-out",                    /* zig */
-	NULL
-};
+    ".git",       "node_modules",  "__pycache__",
+    ".tox",       ".mypy_cache",   ".pytest_cache",
+    ".venv",      "venv",          ".eggs",
+    "*.egg-info", ".next",         ".nuxt",
+    ".output",    "dist",          "build",
+    ".cache",     ".parcel-cache", ".turbo",
+    "target",                /* rust */
+    "_build",                /* elixir/erlang */
+    "deps",                  /* elixir mix */
+    ".zig-cache", "zig-out", /* zig */
+    NULL};
 
 /* ── file type classification ───────────────────────────────────── */
 
 enum ftype {
-	FT_DIR = 0,
-	FT_SOURCE,
-	FT_CONFIG,
-	FT_DOC,
-	FT_BUILD,
-	FT_DATA,
-	FT_MEDIA,
-	FT_ARCHIVE,
-	FT_OTHER,
-	FT_COUNT
+  FT_DIR = 0,
+  FT_SOURCE,
+  FT_CONFIG,
+  FT_DOC,
+  FT_BUILD,
+  FT_DATA,
+  FT_MEDIA,
+  FT_ARCHIVE,
+  FT_OTHER,
+  FT_COUNT
 };
 
 static const char *ftype_labels[] = {
-	[FT_DIR]     = "directories",
-	[FT_SOURCE]  = "source",
-	[FT_CONFIG]  = "config",
-	[FT_DOC]     = "docs",
-	[FT_BUILD]   = "build",
-	[FT_DATA]    = "data",
-	[FT_MEDIA]   = "media",
-	[FT_ARCHIVE] = "archive",
-	[FT_OTHER]   = "other",
+    [FT_DIR] = "directories", [FT_SOURCE] = "source",   [FT_CONFIG] = "config",
+    [FT_DOC] = "docs",        [FT_BUILD] = "build",     [FT_DATA] = "data",
+    [FT_MEDIA] = "media",     [FT_ARCHIVE] = "archive", [FT_OTHER] = "other",
 };
 
-static int has_ext(const char *name, const char *ext)
-{
-	size_t nlen = strlen(name);
-	size_t elen = strlen(ext);
-	if (nlen <= elen) return 0;
-	return strcasecmp(name + nlen - elen, ext) == 0;
+static int has_ext(const char *name, const char *ext) {
+  size_t nlen = strlen(name);
+  size_t elen = strlen(ext);
+  if (nlen <= elen)
+    return 0;
+  return strcasecmp(name + nlen - elen, ext) == 0;
 }
 
-static enum ftype classify(const char *name, int is_dir)
-{
-	if (is_dir) return FT_DIR;
+static enum ftype classify(const char *name, int is_dir) {
+  if (is_dir)
+    return FT_DIR;
 
-	/* exact name matches */
-	if (strcasecmp(name, "Makefile") == 0 ||
-	    strcasecmp(name, "Dockerfile") == 0 ||
-	    strcasecmp(name, "Justfile") == 0 ||
-	    strcasecmp(name, "Taskfile") == 0 ||
-	    strcasecmp(name, "Vagrantfile") == 0 ||
-	    strcasecmp(name, "Rakefile") == 0 ||
-	    strcasecmp(name, "Gemfile") == 0 ||
-	    strcasecmp(name, "Procfile") == 0 ||
-	    strcmp(name, ".editorconfig") == 0 ||
-	    strcmp(name, ".gitignore") == 0 ||
-	    strcmp(name, ".gitattributes") == 0 ||
-	    strcmp(name, ".dockerignore") == 0)
-		return FT_CONFIG;
+  /* exact name matches */
+  if (strcasecmp(name, "Makefile") == 0 ||
+      strcasecmp(name, "Dockerfile") == 0 ||
+      strcasecmp(name, "Justfile") == 0 || strcasecmp(name, "Taskfile") == 0 ||
+      strcasecmp(name, "Vagrantfile") == 0 ||
+      strcasecmp(name, "Rakefile") == 0 || strcasecmp(name, "Gemfile") == 0 ||
+      strcasecmp(name, "Procfile") == 0 || strcmp(name, ".editorconfig") == 0 ||
+      strcmp(name, ".gitignore") == 0 || strcmp(name, ".gitattributes") == 0 ||
+      strcmp(name, ".dockerignore") == 0)
+    return FT_CONFIG;
 
-	if (strcasecmp(name, "LICENSE") == 0 ||
-	    strcasecmp(name, "LICENCE") == 0 ||
-	    strcasecmp(name, "AUTHORS") == 0 ||
-	    strcasecmp(name, "CONTRIBUTORS") == 0 ||
-	    strcasecmp(name, "CHANGELOG") == 0 ||
-	    strcasecmp(name, "CHANGES") == 0 ||
-	    strcasecmp(name, "CONTRIBUTING") == 0)
-		return FT_DOC;
+  if (strcasecmp(name, "LICENSE") == 0 || strcasecmp(name, "LICENCE") == 0 ||
+      strcasecmp(name, "AUTHORS") == 0 ||
+      strcasecmp(name, "CONTRIBUTORS") == 0 ||
+      strcasecmp(name, "CHANGELOG") == 0 || strcasecmp(name, "CHANGES") == 0 ||
+      strcasecmp(name, "CONTRIBUTING") == 0)
+    return FT_DOC;
 
-	/* extension matches */
-	/* source */
-	static const char *src_exts[] = {
-		".c", ".h", ".go", ".rs", ".py", ".js", ".ts", ".tsx",
-		".jsx", ".java", ".rb", ".ex", ".exs", ".erl", ".hrl",
-		".zig", ".swift", ".kt", ".kts", ".lua", ".sh", ".zsh",
-		".bash", ".fish", ".pl", ".pm", ".php", ".cs", ".cpp",
-		".cc", ".cxx", ".hpp", ".hxx", ".m", ".mm", ".scala",
-		".clj", ".cljs", ".hs", ".ml", ".mli", ".r", ".jl",
-		".dart", ".v", ".sv", ".nim", ".cr", ".d", ".f90",
-		".f95", ".asm", ".s", ".sql", ".graphql", ".gql",
-		".proto", ".thrift", ".vue", ".svelte", ".elm",
-		NULL
-	};
-	for (int i = 0; src_exts[i]; i++)
-		if (has_ext(name, src_exts[i])) return FT_SOURCE;
+  /* extension matches */
+  /* source */
+  static const char *src_exts[] = {
+      ".c",     ".h",      ".go",    ".rs",     ".py",  ".js",      ".ts",
+      ".tsx",   ".jsx",    ".java",  ".rb",     ".ex",  ".exs",     ".erl",
+      ".hrl",   ".zig",    ".swift", ".kt",     ".kts", ".lua",     ".sh",
+      ".zsh",   ".bash",   ".fish",  ".pl",     ".pm",  ".php",     ".cs",
+      ".cpp",   ".cc",     ".cxx",   ".hpp",    ".hxx", ".m",       ".mm",
+      ".scala", ".clj",    ".cljs",  ".hs",     ".ml",  ".mli",     ".r",
+      ".jl",    ".dart",   ".v",     ".sv",     ".nim", ".cr",      ".d",
+      ".f90",   ".f95",    ".asm",   ".s",      ".sql", ".graphql", ".gql",
+      ".proto", ".thrift", ".vue",   ".svelte", ".elm", NULL};
+  for (int i = 0; src_exts[i]; i++)
+    if (has_ext(name, src_exts[i]))
+      return FT_SOURCE;
 
-	/* config */
-	static const char *cfg_exts[] = {
-		".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
-		".conf", ".env", ".xml", ".plist", ".properties",
-		".eslintrc", ".prettierrc", ".babelrc",
-		NULL
-	};
-	for (int i = 0; cfg_exts[i]; i++)
-		if (has_ext(name, cfg_exts[i])) return FT_CONFIG;
+  /* config */
+  static const char *cfg_exts[] = {
+      ".json",       ".yaml",     ".yml",        ".toml",    ".ini",
+      ".cfg",        ".conf",     ".env",        ".xml",     ".plist",
+      ".properties", ".eslintrc", ".prettierrc", ".babelrc", NULL};
+  for (int i = 0; cfg_exts[i]; i++)
+    if (has_ext(name, cfg_exts[i]))
+      return FT_CONFIG;
 
-	/* doc */
-	static const char *doc_exts[] = {
-		".md", ".txt", ".rst", ".adoc", ".org", ".tex",
-		".man", ".1", ".2", ".3", ".5", ".8",
-		NULL
-	};
-	for (int i = 0; doc_exts[i]; i++)
-		if (has_ext(name, doc_exts[i])) return FT_DOC;
+  /* doc */
+  static const char *doc_exts[] = {".md",  ".txt", ".rst", ".adoc", ".org",
+                                   ".tex", ".man", ".1",   ".2",    ".3",
+                                   ".5",   ".8",   NULL};
+  for (int i = 0; doc_exts[i]; i++)
+    if (has_ext(name, doc_exts[i]))
+      return FT_DOC;
 
-	/* build artifacts */
-	static const char *bld_exts[] = {
-		".o", ".a", ".so", ".dylib", ".exe", ".dll", ".wasm",
-		".class", ".pyc", ".pyo", ".beam", ".lock", ".sum",
-		NULL
-	};
-	for (int i = 0; bld_exts[i]; i++)
-		if (has_ext(name, bld_exts[i])) return FT_BUILD;
+  /* build artifacts */
+  static const char *bld_exts[] = {".o",    ".a",    ".so",    ".dylib", ".exe",
+                                   ".dll",  ".wasm", ".class", ".pyc",   ".pyo",
+                                   ".beam", ".lock", ".sum",   NULL};
+  for (int i = 0; bld_exts[i]; i++)
+    if (has_ext(name, bld_exts[i]))
+      return FT_BUILD;
 
-	/* data */
-	static const char *dat_exts[] = {
-		".csv", ".tsv", ".parquet", ".sqlite", ".db",
-		".ndjson", ".jsonl", ".avro",
-		NULL
-	};
-	for (int i = 0; dat_exts[i]; i++)
-		if (has_ext(name, dat_exts[i])) return FT_DATA;
+  /* data */
+  static const char *dat_exts[] = {".csv",    ".tsv",  ".parquet",
+                                   ".sqlite", ".db",   ".ndjson",
+                                   ".jsonl",  ".avro", NULL};
+  for (int i = 0; dat_exts[i]; i++)
+    if (has_ext(name, dat_exts[i]))
+      return FT_DATA;
 
-	/* media */
-	static const char *med_exts[] = {
-		".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-		".webp", ".bmp", ".tiff", ".mp3", ".mp4", ".wav",
-		".ogg", ".flac", ".avi", ".mkv", ".mov", ".pdf",
-		NULL
-	};
-	for (int i = 0; med_exts[i]; i++)
-		if (has_ext(name, med_exts[i])) return FT_MEDIA;
+  /* media */
+  static const char *med_exts[] = {".png", ".jpg",  ".jpeg", ".gif",  ".svg",
+                                   ".ico", ".webp", ".bmp",  ".tiff", ".mp3",
+                                   ".mp4", ".wav",  ".ogg",  ".flac", ".avi",
+                                   ".mkv", ".mov",  ".pdf",  NULL};
+  for (int i = 0; med_exts[i]; i++)
+    if (has_ext(name, med_exts[i]))
+      return FT_MEDIA;
 
-	/* archive */
-	static const char *arc_exts[] = {
-		".tar", ".gz", ".tgz", ".zip", ".bz2", ".xz",
-		".7z", ".rar", ".zst", ".lz4",
-		NULL
-	};
-	for (int i = 0; arc_exts[i]; i++)
-		if (has_ext(name, arc_exts[i])) return FT_ARCHIVE;
+  /* archive */
+  static const char *arc_exts[] = {".tar", ".gz",  ".tgz", ".zip",
+                                   ".bz2", ".xz",  ".7z",  ".rar",
+                                   ".zst", ".lz4", NULL};
+  for (int i = 0; arc_exts[i]; i++)
+    if (has_ext(name, arc_exts[i]))
+      return FT_ARCHIVE;
 
-	return FT_OTHER;
+  return FT_OTHER;
 }
 
 /* ── types ─────────────────────────────────────────────────────── */
 
 typedef struct {
-	char name[300];     /* display name with suffix */
-	char perms[12];     /* drwxrwxrwx */
-	char owner[32];     /* username if differs from current user, else empty */
-	char col_a[32];     /* "N files" for dirs, size for files */
-	char col_b[32];     /* "M dirs" for dirs, blank for files */
-	char col_size[16];  /* total subtree size for dirs, empty for files */
-	char git[4];        /* git status char: M, A, ?, D, R, or empty */
-	char time[16];      /* relative time */
-	enum ftype type;    /* file type category */
-	int  depth;
-	int  is_last;
-	int  is_ignored;
-	int  name_len;
-	int  owner_len;
-	int  col_a_len;
-	int  col_b_len;
-	int  col_size_len;
-	int  git_len;
-	int  time_len;
+  char name[300];    /* display name with suffix */
+  char perms[12];    /* drwxrwxrwx */
+  char owner[32];    /* username if differs from current user, else empty */
+  char col_a[32];    /* "N files" for dirs, size for files */
+  char col_b[32];    /* "M dirs" for dirs, blank for files */
+  char col_size[16]; /* total subtree size for dirs, empty for files */
+  char git[4];       /* git status char: M, A, ?, D, R, or empty */
+  char time[16];     /* relative time */
+  enum ftype type;   /* file type category */
+  int depth;
+  int is_last;
+  int is_ignored;
+  int name_len;
+  int owner_len;
+  int col_a_len;
+  int col_b_len;
+  int col_size_len;
+  int git_len;
+  int time_len;
 } row_t;
 
 typedef struct {
-	row_t *rows;
-	int    count;
-	int    capacity;
+  row_t *rows;
+  int count;
+  int capacity;
 } rowlist_t;
 
 typedef struct {
-	int  depth;
-	int  show_all;      /* -a: include dotfiles */
-	int  flat;          /* -f: flat list, no tree, no recurse */
-	int  show_git;      /* -g: show git status column */
-	int  use_gitignore; /* -G: also read .gitignore */
-	int  group_type;    /* -t: group by file type */
+  int depth;
+  int show_all;      /* -a: include dotfiles */
+  int flat;          /* -f: flat list, no tree, no recurse */
+  int show_git;      /* -g: show git status column */
+  int use_gitignore; /* -G: also read .gitignore */
+  int group_type;    /* -t: group by file type */
 } options_t;
 
 /* ── git status map (simple linear scan, fine for project sizes) ── */
 
 typedef struct {
-	char path[512];
-	char status;        /* M, A, ?, D, R, C, U */
+  char path[512];
+  char status; /* M, A, ?, D, R, C, U */
 } git_entry_t;
 
 typedef struct {
-	git_entry_t entries[GIT_MAP_SIZE];
-	int         count;
-	int         active;  /* whether git is available */
-	char        root[512]; /* git repo root */
+  git_entry_t entries[GIT_MAP_SIZE];
+  int count;
+  int active;     /* whether git is available */
+  char root[512]; /* git repo root */
 } git_map_t;
 
 /* ── globals ───────────────────────────────────────────────────── */
 
 static time_t now;
-static uid_t  current_uid;
+static uid_t current_uid;
 static git_map_t git_map;
 
 /* ── helpers ───────────────────────────────────────────────────── */
 
-static int is_ignored(const char *name)
-{
-	for (int i = 0; ignored_dirs[i]; i++) {
-		if (strcmp(name, ignored_dirs[i]) == 0)
-			return 1;
-	}
-	return 0;
+static int is_ignored(const char *name) {
+  for (int i = 0; ignored_dirs[i]; i++) {
+    if (strcmp(name, ignored_dirs[i]) == 0)
+      return 1;
+  }
+  return 0;
 }
 
-static void fmt_size(off_t bytes, char *buf, size_t bufsz)
-{
-	const char *units[] = {"B", "K", "M", "G", "T"};
-	int u = 0;
-	double sz = (double)bytes;
+static void fmt_size(off_t bytes, char *buf, size_t bufsz) {
+  const char *units[] = {"B", "K", "M", "G", "T"};
+  int u = 0;
+  double sz = (double)bytes;
 
-	while (sz >= 1000.0 && u < 4) {
-		sz /= 1024.0;
-		u++;
-	}
+  while (sz >= 1000.0 && u < 4) {
+    sz /= 1024.0;
+    u++;
+  }
 
-	if (u == 0)
-		snprintf(buf, bufsz, "%lldB", (long long)bytes);
-	else if (sz >= 100.0)
-		snprintf(buf, bufsz, "%.0f%s", sz, units[u]);
-	else if (sz >= 10.0)
-		snprintf(buf, bufsz, "%.1f%s", sz, units[u]);
-	else
-		snprintf(buf, bufsz, "%.2f%s", sz, units[u]);
+  if (u == 0)
+    snprintf(buf, bufsz, "%lldB", (long long)bytes);
+  else if (sz >= 100.0)
+    snprintf(buf, bufsz, "%.0f%s", sz, units[u]);
+  else if (sz >= 10.0)
+    snprintf(buf, bufsz, "%.1f%s", sz, units[u]);
+  else
+    snprintf(buf, bufsz, "%.2f%s", sz, units[u]);
 }
 
-static void fmt_reltime(time_t mtime, char *buf, size_t bufsz)
-{
-	long diff = (long)(now - mtime);
-	if (diff < 0) diff = 0;
+static void fmt_reltime(time_t mtime, char *buf, size_t bufsz) {
+  long diff = (long)(now - mtime);
+  if (diff < 0)
+    diff = 0;
 
-	if (diff < 60)
-		snprintf(buf, bufsz, "%lds", diff);
-	else if (diff < 3600)
-		snprintf(buf, bufsz, "%ldm", diff / 60);
-	else if (diff < 86400)
-		snprintf(buf, bufsz, "%ldh", diff / 3600);
-	else if (diff < 86400 * 30)
-		snprintf(buf, bufsz, "%ldd", diff / 86400);
-	else if (diff < 86400 * 365)
-		snprintf(buf, bufsz, "%ldmo", diff / (86400 * 30));
-	else
-		snprintf(buf, bufsz, "%ldy", diff / (86400 * 365));
+  if (diff < 60)
+    snprintf(buf, bufsz, "%lds", diff);
+  else if (diff < 3600)
+    snprintf(buf, bufsz, "%ldm", diff / 60);
+  else if (diff < 86400)
+    snprintf(buf, bufsz, "%ldh", diff / 3600);
+  else if (diff < 86400 * 30)
+    snprintf(buf, bufsz, "%ldd", diff / 86400);
+  else if (diff < 86400 * 365)
+    snprintf(buf, bufsz, "%ldmo", diff / (86400 * 30));
+  else
+    snprintf(buf, bufsz, "%ldy", diff / (86400 * 365));
 }
 
-static void fmt_perms(mode_t mode, char *buf)
-{
-	buf[0] = S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-';
-	buf[1] = (mode & S_IRUSR) ? 'r' : '-';
-	buf[2] = (mode & S_IWUSR) ? 'w' : '-';
-	buf[3] = (mode & S_IXUSR) ? 'x' : '-';
-	buf[4] = (mode & S_IRGRP) ? 'r' : '-';
-	buf[5] = (mode & S_IWGRP) ? 'w' : '-';
-	buf[6] = (mode & S_IXGRP) ? 'x' : '-';
-	buf[7] = (mode & S_IROTH) ? 'r' : '-';
-	buf[8] = (mode & S_IWOTH) ? 'w' : '-';
-	buf[9] = (mode & S_IXOTH) ? 'x' : '-';
-	buf[10] = '\0';
+static void fmt_perms(mode_t mode, char *buf) {
+  buf[0] = S_ISDIR(mode) ? 'd' : S_ISLNK(mode) ? 'l' : '-';
+  buf[1] = (mode & S_IRUSR) ? 'r' : '-';
+  buf[2] = (mode & S_IWUSR) ? 'w' : '-';
+  buf[3] = (mode & S_IXUSR) ? 'x' : '-';
+  buf[4] = (mode & S_IRGRP) ? 'r' : '-';
+  buf[5] = (mode & S_IWGRP) ? 'w' : '-';
+  buf[6] = (mode & S_IXGRP) ? 'x' : '-';
+  buf[7] = (mode & S_IROTH) ? 'r' : '-';
+  buf[8] = (mode & S_IWOTH) ? 'w' : '-';
+  buf[9] = (mode & S_IXOTH) ? 'x' : '-';
+  buf[10] = '\0';
 }
 
 /* ── git status ────────────────────────────────────────────────── */
 
-static void git_map_init(void)
-{
-	memset(&git_map, 0, sizeof(git_map));
+static void git_map_init(void) {
+  memset(&git_map, 0, sizeof(git_map));
 
-	/* find git root */
-	FILE *fp = popen("git rev-parse --show-toplevel 2>/dev/null", "r");
-	if (!fp) return;
+  /* find git root */
+  FILE *fp = popen("git rev-parse --show-toplevel 2>/dev/null", "r");
+  if (!fp)
+    return;
 
-	if (fgets(git_map.root, sizeof(git_map.root), fp) == NULL) {
-		pclose(fp);
-		return;
-	}
-	pclose(fp);
+  if (fgets(git_map.root, sizeof(git_map.root), fp) == NULL) {
+    pclose(fp);
+    return;
+  }
+  pclose(fp);
 
-	/* strip newline */
-	size_t len = strlen(git_map.root);
-	if (len > 0 && git_map.root[len - 1] == '\n')
-		git_map.root[len - 1] = '\0';
+  /* strip newline */
+  size_t len = strlen(git_map.root);
+  if (len > 0 && git_map.root[len - 1] == '\n')
+    git_map.root[len - 1] = '\0';
 
-	/* get status */
-	fp = popen("git status --porcelain 2>/dev/null", "r");
-	if (!fp) return;
+  /* get status */
+  fp = popen("git status --porcelain 2>/dev/null", "r");
+  if (!fp)
+    return;
 
-	git_map.active = 1;
+  git_map.active = 1;
 
-	char line[1024];
-	while (fgets(line, sizeof(line), fp) && git_map.count < GIT_MAP_SIZE) {
-		if (strlen(line) < 4) continue;
+  char line[1024];
+  while (fgets(line, sizeof(line), fp) && git_map.count < GIT_MAP_SIZE) {
+    if (strlen(line) < 4)
+      continue;
 
-		git_entry_t *ge = &git_map.entries[git_map.count];
+    git_entry_t *ge = &git_map.entries[git_map.count];
 
-		/* porcelain format: XY filename
-		 * X = index status, Y = worktree status
-		 * prefer worktree status (Y) unless it's space, then use X */
-		char x = line[0];
-		char y = line[1];
+    /* porcelain format: XY filename
+     * X = index status, Y = worktree status
+     * prefer worktree status (Y) unless it's space, then use X */
+    char x = line[0];
+    char y = line[1];
 
-		if (y != ' ' && y != '\n')
-			ge->status = y;
-		else if (x != ' ')
-			ge->status = x;
-		else
-			continue;
+    if (y != ' ' && y != '\n')
+      ge->status = y;
+    else if (x != ' ')
+      ge->status = x;
+    else
+      continue;
 
-		/* map to single meaningful char */
-		switch (ge->status) {
-		case '?': ge->status = '?'; break;
-		case 'M': ge->status = 'M'; break;
-		case 'A': ge->status = 'A'; break;
-		case 'D': ge->status = 'D'; break;
-		case 'R': ge->status = 'R'; break;
-		case 'C': ge->status = 'C'; break;
-		case 'U': ge->status = 'U'; break;
-		default:  ge->status = '~'; break;
-		}
+    /* map to single meaningful char */
+    switch (ge->status) {
+    case '?':
+      ge->status = '?';
+      break;
+    case 'M':
+      ge->status = 'M';
+      break;
+    case 'A':
+      ge->status = 'A';
+      break;
+    case 'D':
+      ge->status = 'D';
+      break;
+    case 'R':
+      ge->status = 'R';
+      break;
+    case 'C':
+      ge->status = 'C';
+      break;
+    case 'U':
+      ge->status = 'U';
+      break;
+    default:
+      ge->status = '~';
+      break;
+    }
 
-		/* extract path (skip "XY ") */
-		char *path = line + 3;
-		size_t plen = strlen(path);
-		if (plen > 0 && path[plen - 1] == '\n')
-			path[plen - 1] = '\0';
+    /* extract path (skip "XY ") */
+    char *path = line + 3;
+    size_t plen = strlen(path);
+    if (plen > 0 && path[plen - 1] == '\n')
+      path[plen - 1] = '\0';
 
-		/* strip quotes if present */
-		if (path[0] == '"') {
-			path++;
-			plen = strlen(path);
-			if (plen > 0 && path[plen - 1] == '"')
-				path[plen - 1] = '\0';
-		}
+    /* strip quotes if present */
+    if (path[0] == '"') {
+      path++;
+      plen = strlen(path);
+      if (plen > 0 && path[plen - 1] == '"')
+        path[plen - 1] = '\0';
+    }
 
-		strncpy(ge->path, path, sizeof(ge->path) - 1);
-		git_map.count++;
-	}
+    strncpy(ge->path, path, sizeof(ge->path) - 1);
+    git_map.count++;
+  }
 
-	pclose(fp);
+  pclose(fp);
 }
 
 /*
  * Look up git status for a path relative to cwd.
  * Returns status char or 0 if clean/unknown.
  */
-static char git_status_for(const char *relpath)
-{
-	if (!git_map.active) return 0;
+static char git_status_for(const char *relpath) {
+  if (!git_map.active)
+    return 0;
 
-	for (int i = 0; i < git_map.count; i++) {
-		/* exact match */
-		if (strcmp(git_map.entries[i].path, relpath) == 0)
-			return git_map.entries[i].status;
-		/* directory prefix match (any file under this dir is dirty) */
-		size_t rlen = strlen(relpath);
-		if (strncmp(git_map.entries[i].path, relpath, rlen) == 0 &&
-		    git_map.entries[i].path[rlen] == '/')
-			return git_map.entries[i].status;
-	}
-	return 0;
+  for (int i = 0; i < git_map.count; i++) {
+    /* exact match */
+    if (strcmp(git_map.entries[i].path, relpath) == 0)
+      return git_map.entries[i].status;
+    /* directory prefix match (any file under this dir is dirty) */
+    size_t rlen = strlen(relpath);
+    if (strncmp(git_map.entries[i].path, relpath, rlen) == 0 &&
+        git_map.entries[i].path[rlen] == '/')
+      return git_map.entries[i].status;
+  }
+  return 0;
 }
 
 /* ── owner lookup ──────────────────────────────────────────────── */
 
-static const char *owner_name(uid_t uid)
-{
-	if (uid == current_uid) return NULL;
-	struct passwd *pw = getpwuid(uid);
-	return pw ? pw->pw_name : "?";
+static const char *owner_name(uid_t uid) {
+  if (uid == current_uid)
+    return NULL;
+  struct passwd *pw = getpwuid(uid);
+  return pw ? pw->pw_name : "?";
 }
 
 /* ── row list management ───────────────────────────────────────── */
 
-static void rowlist_init(rowlist_t *rl)
-{
-	rl->capacity = INITIAL_ROWS;
-	rl->count = 0;
-	rl->rows = malloc(rl->capacity * sizeof(row_t));
-	if (!rl->rows) {
-		fprintf(stderr, "dl: out of memory\n");
-		exit(1);
-	}
+static void rowlist_init(rowlist_t *rl) {
+  rl->capacity = INITIAL_ROWS;
+  rl->count = 0;
+  rl->rows = malloc(rl->capacity * sizeof(row_t));
+  if (!rl->rows) {
+    fprintf(stderr, "dl: out of memory\n");
+    exit(1);
+  }
 }
 
-static row_t *rowlist_add(rowlist_t *rl)
-{
-	if (rl->count >= rl->capacity) {
-		rl->capacity *= 2;
-		rl->rows = realloc(rl->rows, rl->capacity * sizeof(row_t));
-		if (!rl->rows) {
-			fprintf(stderr, "dl: out of memory\n");
-			exit(1);
-		}
-	}
-	row_t *r = &rl->rows[rl->count++];
-	memset(r, 0, sizeof(*r));
-	return r;
+static row_t *rowlist_add(rowlist_t *rl) {
+  if (rl->count >= rl->capacity) {
+    rl->capacity *= 2;
+    rl->rows = realloc(rl->rows, rl->capacity * sizeof(row_t));
+    if (!rl->rows) {
+      fprintf(stderr, "dl: out of memory\n");
+      exit(1);
+    }
+  }
+  row_t *r = &rl->rows[rl->count++];
+  memset(r, 0, sizeof(*r));
+  return r;
 }
 
-static void rowlist_free(rowlist_t *rl)
-{
-	free(rl->rows);
-}
+static void rowlist_free(rowlist_t *rl) { free(rl->rows); }
 
 /* ── entry sorting ─────────────────────────────────────────────── */
 
 typedef struct {
-	char      name[256];
-	mode_t    mode;
-	uid_t     uid;
-	off_t     size;
-	off_t     subtree_size;   /* total bytes under dir */
-	time_t    mtime;
-	enum ftype type;
-	int       is_dir;
-	int       is_link;
-	int       is_ignored;
-	int       nfiles;
-	int       ndirs;
-	char      link_target[4096];
+  char name[256];
+  mode_t mode;
+  uid_t uid;
+  off_t size;
+  off_t subtree_size; /* total bytes under dir */
+  time_t mtime;
+  enum ftype type;
+  int is_dir;
+  int is_link;
+  int is_ignored;
+  int nfiles;
+  int ndirs;
+  char link_target[4096];
 } entry_t;
 
 /* default sort: dirs first, then alpha */
-static int entry_cmp(const void *a, const void *b)
-{
-	const entry_t *ea = (const entry_t *)a;
-	const entry_t *eb = (const entry_t *)b;
+static int entry_cmp(const void *a, const void *b) {
+  const entry_t *ea = (const entry_t *)a;
+  const entry_t *eb = (const entry_t *)b;
 
-	if (ea->is_dir != eb->is_dir)
-		return eb->is_dir - ea->is_dir;
+  if (ea->is_dir != eb->is_dir)
+    return eb->is_dir - ea->is_dir;
 
-	return strcasecmp(ea->name, eb->name);
+  return strcasecmp(ea->name, eb->name);
 }
 
 /* type-grouped sort: by type category, then alpha within each */
-static int entry_cmp_type(const void *a, const void *b)
-{
-	const entry_t *ea = (const entry_t *)a;
-	const entry_t *eb = (const entry_t *)b;
+static int entry_cmp_type(const void *a, const void *b) {
+  const entry_t *ea = (const entry_t *)a;
+  const entry_t *eb = (const entry_t *)b;
 
-	if (ea->type != eb->type)
-		return (int)ea->type - (int)eb->type;
+  if (ea->type != eb->type)
+    return (int)ea->type - (int)eb->type;
 
-	return strcasecmp(ea->name, eb->name);
+  return strcasecmp(ea->name, eb->name);
 }
 
 /* ── directory scanning ────────────────────────────────────────── */
@@ -504,46 +495,48 @@ static int entry_cmp_type(const void *a, const void *b)
  * max_depth. Within max_depth, `collect` recurses and reuses the
  * stats it computes, avoiding a second walk of the same subtree.
  */
-static void scan_stats(int parent_fd, const char *name,
-                       int *nfiles, int *ndirs, off_t *total_size)
-{
-	*nfiles = 0;
-	*ndirs = 0;
-	*total_size = 0;
+static void scan_stats(int parent_fd, const char *name, int *nfiles, int *ndirs,
+                       off_t *total_size) {
+  *nfiles = 0;
+  *ndirs = 0;
+  *total_size = 0;
 
-	int fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY);
-	if (fd < 0) return;
+  int fd = openat(parent_fd, name, O_RDONLY | O_DIRECTORY);
+  if (fd < 0)
+    return;
 
-	DIR *d = fdopendir(fd);
-	if (!d) { close(fd); return; }
+  DIR *d = fdopendir(fd);
+  if (!d) {
+    close(fd);
+    return;
+  }
 
-	struct dirent *de;
-	while ((de = readdir(d)) != NULL) {
-		if (de->d_name[0] == '.' &&
-		    (de->d_name[1] == '\0' ||
-		     (de->d_name[1] == '.' && de->d_name[2] == '\0')))
-			continue;
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (de->d_name[0] == '.' &&
+        (de->d_name[1] == '\0' ||
+         (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+      continue;
 
-		struct stat st;
-		if (fstatat(fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
-			continue;
+    struct stat st;
+    if (fstatat(fd, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+      continue;
 
-		if (S_ISDIR(st.st_mode)) {
-			(*ndirs)++;
-			if (is_ignored(de->d_name))
-				continue;
-			int sub_nf, sub_nd;
-			off_t sub_sz;
-			scan_stats(fd, de->d_name,
-			           &sub_nf, &sub_nd, &sub_sz);
-			*total_size += sub_sz;
-		} else {
-			(*nfiles)++;
-			*total_size += st.st_size;
-		}
-	}
+    if (S_ISDIR(st.st_mode)) {
+      (*ndirs)++;
+      if (is_ignored(de->d_name))
+        continue;
+      int sub_nf, sub_nd;
+      off_t sub_sz;
+      scan_stats(fd, de->d_name, &sub_nf, &sub_nd, &sub_sz);
+      *total_size += sub_sz;
+    } else {
+      (*nfiles)++;
+      *total_size += st.st_size;
+    }
+  }
 
-	closedir(d);
+  closedir(d);
 }
 
 /*
@@ -552,592 +545,602 @@ static void scan_stats(int parent_fd, const char *name,
  * recursive total byte size via out params, so callers that already
  * recursed don't need a second walk to produce those numbers.
  */
-static void collect(int parent_fd, const char *dirname,
-                    int depth, int max_depth,
-                    const options_t *opts,
-                    rowlist_t *rl,
-                    const char *relpath,  /* path relative to start dir */
-                    int *out_nfiles, int *out_ndirs, off_t *out_size)
-{
-	*out_nfiles = 0;
-	*out_ndirs = 0;
-	*out_size = 0;
+static void collect(int parent_fd, const char *dirname, int depth,
+                    int max_depth, const options_t *opts, rowlist_t *rl,
+                    const char *relpath, /* path relative to start dir */
+                    int *out_nfiles, int *out_ndirs, off_t *out_size) {
+  *out_nfiles = 0;
+  *out_ndirs = 0;
+  *out_size = 0;
 
+  int fd = openat(parent_fd, dirname, O_RDONLY | O_DIRECTORY);
+  if (fd < 0) {
+    fprintf(stderr, "dl: %s: %s\n", dirname, strerror(errno));
+    return;
+  }
 
-	int fd = openat(parent_fd, dirname, O_RDONLY | O_DIRECTORY);
-	if (fd < 0) {
-		fprintf(stderr, "dl: %s: %s\n", dirname, strerror(errno));
-		return;
-	}
+  int fd2 = dup(fd);
+  if (fd2 < 0) {
+    close(fd);
+    return;
+  }
 
-	int fd2 = dup(fd);
-	if (fd2 < 0) { close(fd); return; }
+  DIR *d = fdopendir(fd);
+  if (!d) {
+    close(fd);
+    close(fd2);
+    return;
+  }
 
-	DIR *d = fdopendir(fd);
-	if (!d) { close(fd); close(fd2); return; }
+  entry_t *entries = malloc(8192 * sizeof(entry_t));
+  if (!entries) {
+    closedir(d);
+    close(fd2);
+    return;
+  }
 
-	entry_t *entries = malloc(8192 * sizeof(entry_t));
-	if (!entries) { closedir(d); close(fd2); return; }
+  int n = 0;
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL && n < 8192) {
+    if (de->d_name[0] == '.' &&
+        (de->d_name[1] == '\0' ||
+         (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+      continue;
 
-	int n = 0;
-	struct dirent *de;
-	while ((de = readdir(d)) != NULL && n < 8192) {
-		if (de->d_name[0] == '.' &&
-		    (de->d_name[1] == '\0' ||
-		     (de->d_name[1] == '.' && de->d_name[2] == '\0')))
-			continue;
+    if (!opts->show_all && de->d_name[0] == '.')
+      continue;
 
-		if (!opts->show_all && de->d_name[0] == '.')
-			continue;
+    entry_t *e = &entries[n];
+    memset(e, 0, sizeof(*e));
+    strncpy(e->name, de->d_name, sizeof(e->name) - 1);
 
-		entry_t *e = &entries[n];
-		memset(e, 0, sizeof(*e));
-		strncpy(e->name, de->d_name, sizeof(e->name) - 1);
+    struct stat st;
+    if (fstatat(fd2, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+      continue;
 
-		struct stat st;
-		if (fstatat(fd2, de->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
-			continue;
+    e->mode = st.st_mode;
+    e->uid = st.st_uid;
+    e->size = st.st_size;
+    e->is_dir = S_ISDIR(st.st_mode);
+    e->is_link = S_ISLNK(st.st_mode);
+    e->mtime = st.st_mtime;
 
-		e->mode = st.st_mode;
-		e->uid = st.st_uid;
-		e->size = st.st_size;
-		e->is_dir = S_ISDIR(st.st_mode);
-		e->is_link = S_ISLNK(st.st_mode);
-		e->mtime = st.st_mtime;
+    if (e->is_link) {
+      ssize_t len = readlinkat(fd2, de->d_name, e->link_target,
+                               sizeof(e->link_target) - 1);
+      if (len > 0)
+        e->link_target[len] = '\0';
+    }
 
-		if (e->is_link) {
-			ssize_t len = readlinkat(fd2, de->d_name,
-			                         e->link_target,
-			                         sizeof(e->link_target) - 1);
-			if (len > 0) e->link_target[len] = '\0';
-		}
+    e->type = classify(de->d_name, e->is_dir);
 
-		e->type = classify(de->d_name, e->is_dir);
+    if (e->is_dir)
+      e->is_ignored = is_ignored(de->d_name);
 
-		if (e->is_dir)
-			e->is_ignored = is_ignored(de->d_name);
+    n++;
+  }
 
-		n++;
-	}
+  closedir(d);
 
-	closedir(d);
+  if (opts->group_type)
+    qsort(entries, n, sizeof(entry_t), entry_cmp_type);
+  else
+    qsort(entries, n, sizeof(entry_t), entry_cmp);
 
-	if (opts->group_type)
-		qsort(entries, n, sizeof(entry_t), entry_cmp_type);
-	else
-		qsort(entries, n, sizeof(entry_t), entry_cmp);
+  for (int i = 0; i < n; i++) {
+    entry_t *e = &entries[i];
+    int row_idx = rl->count;
+    row_t *r = rowlist_add(rl);
 
-	for (int i = 0; i < n; i++) {
-		entry_t *e = &entries[i];
-		int row_idx = rl->count;
-		row_t *r = rowlist_add(rl);
+    r->depth = opts->flat ? 0 : depth;
+    r->is_last = (i == n - 1);
+    r->is_ignored = e->is_ignored;
+    r->type = e->type;
 
-		r->depth = opts->flat ? 0 : depth;
-		r->is_last = (i == n - 1);
-		r->is_ignored = e->is_ignored;
-		r->type = e->type;
+    /* name with type suffix */
+    if (e->is_dir)
+      r->name_len = snprintf(r->name, sizeof(r->name), "%s/", e->name);
+    else if (e->is_link)
+      r->name_len = snprintf(r->name, sizeof(r->name), "%s@", e->name);
+    else if (e->mode & S_IXUSR)
+      r->name_len = snprintf(r->name, sizeof(r->name), "%s*", e->name);
+    else
+      r->name_len = snprintf(r->name, sizeof(r->name), "%s", e->name);
 
-		/* name with type suffix */
-		if (e->is_dir)
-			r->name_len = snprintf(r->name, sizeof(r->name),
-			                       "%s/", e->name);
-		else if (e->is_link)
-			r->name_len = snprintf(r->name, sizeof(r->name),
-			                       "%s@", e->name);
-		else if (e->mode & S_IXUSR)
-			r->name_len = snprintf(r->name, sizeof(r->name),
-			                       "%s*", e->name);
-		else
-			r->name_len = snprintf(r->name, sizeof(r->name),
-			                       "%s", e->name);
+    /* permissions */
+    fmt_perms(e->mode, r->perms);
 
-		/* permissions */
-		fmt_perms(e->mode, r->perms);
+    /* owner (only if different from current user) */
+    const char *own = owner_name(e->uid);
+    if (own) {
+      r->owner_len = snprintf(r->owner, sizeof(r->owner), "%s", own);
+    }
 
-		/* owner (only if different from current user) */
-		const char *own = owner_name(e->uid);
-		if (own) {
-			r->owner_len = snprintf(r->owner, sizeof(r->owner),
-			                        "%s", own);
-		}
+    /* file col_a = size (directory columns are filled below,
+     * after we know the subtree stats). */
+    if (!e->is_dir) {
+      fmt_size(e->size, r->col_a, sizeof(r->col_a));
+      r->col_a_len = (int)strlen(r->col_a);
+      (*out_nfiles)++;
+      (*out_size) += e->size;
+    }
 
-		/* file col_a = size (directory columns are filled below,
-		 * after we know the subtree stats). */
-		if (!e->is_dir) {
-			fmt_size(e->size, r->col_a, sizeof(r->col_a));
-			r->col_a_len = (int)strlen(r->col_a);
-			(*out_nfiles)++;
-			(*out_size) += e->size;
-		}
+    if (e->is_link && e->link_target[0]) {
+      r->col_b_len =
+          snprintf(r->col_b, sizeof(r->col_b), "-> %s", e->link_target);
+    }
 
-		if (e->is_link && e->link_target[0]) {
-			r->col_b_len = snprintf(r->col_b, sizeof(r->col_b),
-			                        "-> %s", e->link_target);
-		}
+    /* git status */
+    if (opts->show_git && !e->is_ignored) {
+      char entry_relpath[1024];
+      if (relpath[0])
+        snprintf(entry_relpath, sizeof(entry_relpath), "%s/%s", relpath,
+                 e->name);
+      else
+        snprintf(entry_relpath, sizeof(entry_relpath), "%s", e->name);
 
-		/* git status */
-		if (opts->show_git && !e->is_ignored) {
-			char entry_relpath[1024];
-			if (relpath[0])
-				snprintf(entry_relpath, sizeof(entry_relpath),
-				         "%s/%s", relpath, e->name);
-			else
-				snprintf(entry_relpath, sizeof(entry_relpath),
-				         "%s", e->name);
+      char gs = git_status_for(entry_relpath);
+      if (gs) {
+        r->git[0] = gs;
+        r->git[1] = '\0';
+        r->git_len = 1;
+      }
+    }
 
-			char gs = git_status_for(entry_relpath);
-			if (gs) {
-				r->git[0] = gs;
-				r->git[1] = '\0';
-				r->git_len = 1;
-			}
-		}
+    /* time */
+    if (!e->is_ignored) {
+      fmt_reltime(e->mtime, r->time, sizeof(r->time));
+      r->time_len = (int)strlen(r->time);
+    }
 
-		/* time */
-		if (!e->is_ignored) {
-			fmt_reltime(e->mtime, r->time, sizeof(r->time));
-			r->time_len = (int)strlen(r->time);
-		}
+    if (!e->is_dir)
+      continue;
 
-		if (!e->is_dir)
-			continue;
+    (*out_ndirs)++;
 
-		(*out_ndirs)++;
+    if (e->is_ignored) {
+      /* r may be stale after earlier rowlist_add calls in
+       * the loop — but no recursion has happened for this
+       * entry yet, so `r` is still valid here. */
+      r->col_a_len = snprintf(r->col_a, sizeof(r->col_a), "ignored");
+      continue;
+    }
 
-		if (e->is_ignored) {
-			/* r may be stale after earlier rowlist_add calls in
-			 * the loop — but no recursion has happened for this
-			 * entry yet, so `r` is still valid here. */
-			r->col_a_len = snprintf(r->col_a, sizeof(r->col_a),
-			                        "ignored");
-			continue;
-		}
+    /* Compute the directory's stats. Either we recurse (emitting
+     * rows for its contents and getting the stats for free) or we
+     * fall back to scan_stats for dirs past max_depth. This is the
+     * whole point of the refactor: no subtree is walked twice. */
+    int sub_nf = 0, sub_nd = 0;
+    off_t sub_sz = 0;
 
-		/* Compute the directory's stats. Either we recurse (emitting
-		 * rows for its contents and getting the stats for free) or we
-		 * fall back to scan_stats for dirs past max_depth. This is the
-		 * whole point of the refactor: no subtree is walked twice. */
-		int sub_nf = 0, sub_nd = 0;
-		off_t sub_sz = 0;
+    if (!opts->flat && depth + 1 < max_depth) {
+      char child_relpath[1024];
+      if (relpath[0])
+        snprintf(child_relpath, sizeof(child_relpath), "%s/%s", relpath,
+                 e->name);
+      else
+        snprintf(child_relpath, sizeof(child_relpath), "%s", e->name);
 
-		if (!opts->flat && depth + 1 < max_depth) {
-			char child_relpath[1024];
-			if (relpath[0])
-				snprintf(child_relpath, sizeof(child_relpath),
-				         "%s/%s", relpath, e->name);
-			else
-				snprintf(child_relpath, sizeof(child_relpath),
-				         "%s", e->name);
+      collect(fd2, e->name, depth + 1, max_depth, opts, rl, child_relpath,
+              &sub_nf, &sub_nd, &sub_sz);
+    } else {
+      scan_stats(fd2, e->name, &sub_nf, &sub_nd, &sub_sz);
+    }
 
-			collect(fd2, e->name, depth + 1, max_depth,
-			        opts, rl, child_relpath,
-			        &sub_nf, &sub_nd, &sub_sz);
-		} else {
-			scan_stats(fd2, e->name, &sub_nf, &sub_nd, &sub_sz);
-		}
+    /* Re-fetch the row pointer — recursive collect calls may
+     * have realloc'd rl->rows, invalidating the earlier `r`. */
+    r = &rl->rows[row_idx];
 
-		/* Re-fetch the row pointer — recursive collect calls may
-		 * have realloc'd rl->rows, invalidating the earlier `r`. */
-		r = &rl->rows[row_idx];
+    if (sub_nf > 0) {
+      r->col_a_len = snprintf(r->col_a, sizeof(r->col_a), "%d files", sub_nf);
+    }
+    if (sub_nd > 0) {
+      r->col_b_len = snprintf(r->col_b, sizeof(r->col_b), "%d dirs", sub_nd);
+    }
+    if (sub_sz > 0) {
+      fmt_size(sub_sz, r->col_size, sizeof(r->col_size));
+      r->col_size_len = (int)strlen(r->col_size);
+    }
 
-		if (sub_nf > 0) {
-			r->col_a_len = snprintf(r->col_a, sizeof(r->col_a),
-			                        "%d files", sub_nf);
-		}
-		if (sub_nd > 0) {
-			r->col_b_len = snprintf(r->col_b, sizeof(r->col_b),
-			                        "%d dirs", sub_nd);
-		}
-		if (sub_sz > 0) {
-			fmt_size(sub_sz, r->col_size, sizeof(r->col_size));
-			r->col_size_len = (int)strlen(r->col_size);
-		}
+    (*out_size) += sub_sz;
+  }
 
-		(*out_size) += sub_sz;
-	}
-
-	free(entries);
-	close(fd2);
+  free(entries);
+  close(fd2);
 }
 
 /* ── output ────────────────────────────────────────────────────── */
 
-static int get_term_height(void)
-{
-	struct winsize ws;
-	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
-		return ws.ws_row;
-	return 24; /* fallback */
+static int get_term_height(void) {
+  struct winsize ws;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+    return ws.ws_row;
+  return 24; /* fallback */
 }
 
-static int get_term_width(void)
-{
-	struct winsize ws;
-	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
-		return ws.ws_col;
-	return 80; /* fallback */
+static int get_term_width(void) {
+  struct winsize ws;
+  if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+    return ws.ws_col;
+  return 80; /* fallback */
 }
 
 /*
  * Tab-separated output for piping.
  * Fields: name, perms, owner, git, files_or_size, dirs, subtree_size, time
  */
-static void print_tsv(const rowlist_t *rl, const options_t *opts)
-{
-	/* ignore SIGPIPE — downstream may close early */
-	signal(SIGPIPE, SIG_IGN);
+static void print_tsv(const rowlist_t *rl, const options_t *opts) {
+  /* ignore SIGPIPE — downstream may close early */
+  signal(SIGPIPE, SIG_IGN);
 
-	for (int i = 0; i < rl->count; i++) {
-		const row_t *r = &rl->rows[i];
+  for (int i = 0; i < rl->count; i++) {
+    const row_t *r = &rl->rows[i];
 
-		fprintf(stdout, "%s\t%s\t%s",
-		        r->name, r->perms, r->owner);
+    fprintf(stdout, "%s\t%s\t%s", r->name, r->perms, r->owner);
 
-		if (opts->show_git)
-			fprintf(stdout, "\t%s", r->git);
+    if (opts->show_git)
+      fprintf(stdout, "\t%s", r->git);
 
-		fprintf(stdout, "\t%s\t%s\t%s\t%s\n",
-		        r->col_a, r->col_b, r->col_size,
-		        r->is_ignored ? "" : r->time);
-	}
+    fprintf(stdout, "\t%s\t%s\t%s\t%s\n", r->col_a, r->col_b, r->col_size,
+            r->is_ignored ? "" : r->time);
+  }
 }
 
 /*
  * Print col_b honoring width budget: right-align if fits, else truncate
  * with "..." suffix. Leading two spaces are the column separator.
  */
-static void print_col_b(FILE *out, const row_t *r, int budget)
-{
-	if (r->col_b_len <= budget)
-		fprintf(out, "  %*s", budget, r->col_b);
-	else if (budget >= 3)
-		fprintf(out, "  %.*s...", budget - 3, r->col_b);
-	else
-		fprintf(out, "  %.*s", budget, "...");
+static void print_col_b(FILE *out, const row_t *r, int budget) {
+  if (r->col_b_len <= budget)
+    fprintf(out, "  %*s", budget, r->col_b);
+  else if (budget >= 3)
+    fprintf(out, "  %.*s...", budget - 3, r->col_b);
+  else
+    fprintf(out, "  %.*s", budget, "...");
 }
 
-static void print_pretty(const rowlist_t *rl, const options_t *opts)
-{
-	if (rl->count == 0) return;
+static void print_pretty(const rowlist_t *rl, const options_t *opts) {
+  if (rl->count == 0)
+    return;
 
-	#define INDENT_COLS(d) ((d) == 0 ? 0 : 3 + ((d) - 1) * 4)
+#define INDENT_COLS(d) ((d) == 0 ? 0 : 3 + ((d) - 1) * 4)
 
-	/* compute global column widths */
-	int w_name = 0;
-	int w_owner = 0;
-	int w_col_a = 0;
-	int w_col_b = 0;
-	int w_col_size = 0;
-	int w_git = 0;
-	int w_time = 0;
-	int max_depth_seen = 0;
+  /* compute global column widths */
+  int w_name = 0;
+  int w_owner = 0;
+  int w_col_a = 0;
+  int w_col_b = 0;
+  int w_col_size = 0;
+  int w_git = 0;
+  int w_time = 0;
+  int max_depth_seen = 0;
 
-	for (int i = 0; i < rl->count; i++) {
-		const row_t *r = &rl->rows[i];
-		int col1 = INDENT_COLS(r->depth) + r->name_len;
-		if (col1 > w_name) w_name = col1;
-		if (r->owner_len > w_owner) w_owner = r->owner_len;
-		if (r->col_a_len > w_col_a) w_col_a = r->col_a_len;
-		if (r->col_b_len > w_col_b) w_col_b = r->col_b_len;
-		if (r->col_size_len > w_col_size) w_col_size = r->col_size_len;
-		if (r->git_len > w_git) w_git = r->git_len;
-		if (r->time_len > w_time) w_time = r->time_len;
-		if (r->depth > max_depth_seen) max_depth_seen = r->depth;
-	}
+  for (int i = 0; i < rl->count; i++) {
+    const row_t *r = &rl->rows[i];
+    int col1 = INDENT_COLS(r->depth) + r->name_len;
+    if (col1 > w_name)
+      w_name = col1;
+    if (r->owner_len > w_owner)
+      w_owner = r->owner_len;
+    if (r->col_a_len > w_col_a)
+      w_col_a = r->col_a_len;
+    if (r->col_b_len > w_col_b)
+      w_col_b = r->col_b_len;
+    if (r->col_size_len > w_col_size)
+      w_col_size = r->col_size_len;
+    if (r->git_len > w_git)
+      w_git = r->git_len;
+    if (r->time_len > w_time)
+      w_time = r->time_len;
+    if (r->depth > max_depth_seen)
+      max_depth_seen = r->depth;
+  }
 
-	/*
-	 * Metadata-only width (everything after the name column, minus col_b).
-	 * Reused for single-line col_b budget and two-line layout decision.
-	 */
-	int meta_fixed = 2 + 10; /* two spaces + perms */
-	if (w_owner > 0) meta_fixed += 2 + w_owner;
-	if (opts->show_git)
-		meta_fixed += (w_git > 0) ? 2 + w_git : 3;
-	meta_fixed += 2 + w_col_a;
-	if (w_col_size > 0) meta_fixed += 2 + w_col_size;
-	meta_fixed += 2 + w_time + 4; /* two spaces + time + " ago" */
+  /*
+   * Metadata-only width (everything after the name column, minus col_b).
+   * Reused for single-line col_b budget and two-line layout decision.
+   */
+  int meta_fixed = 2 + 10; /* two spaces + perms */
+  if (w_owner > 0)
+    meta_fixed += 2 + w_owner;
+  if (opts->show_git)
+    meta_fixed += (w_git > 0) ? 2 + w_git : 3;
+  meta_fixed += 2 + w_col_a;
+  if (w_col_size > 0)
+    meta_fixed += 2 + w_col_size;
+  meta_fixed += 2 + w_time + 4; /* two spaces + time + " ago" */
 
-	int term_w = get_term_width();
+  int term_w = get_term_width();
 
-	/*
-	 * Adaptive layout: fall back to two-line rendering when a single row
-	 * would overflow the terminal. Content-aware — no fixed threshold.
-	 */
-	int single_required = w_name + meta_fixed;
-	if (w_col_b > 0) single_required += 2 + w_col_b;
-	int two_line = single_required > term_w;
+  /*
+   * Adaptive layout: fall back to two-line rendering when a single row
+   * would overflow the terminal. Content-aware — no fixed threshold.
+   */
+  int single_required = w_name + meta_fixed;
+  if (w_col_b > 0)
+    single_required += 2 + w_col_b;
+  int two_line = single_required > term_w;
 
-	/*
-	 * Cap w_col_b to available budget in the active layout. col_b can
-	 * hold "-> <symlink>" which is unbounded and would otherwise wrap.
-	 */
-	if (w_col_b > 0) {
-		int prefix;
-		if (two_line) {
-			/* line 2: tree continuation (4 cols per level) or 2-col indent */
-			prefix = (opts->flat || max_depth_seen == 0)
-			       ? 2 : max_depth_seen * 4;
-		} else {
-			prefix = w_name;
-		}
-		int budget = term_w - prefix - meta_fixed - 2; /* 2 = col_b separator */
-		if (budget < 4) budget = 4;
-		if (w_col_b > budget) w_col_b = budget;
-	}
+  /*
+   * Cap w_col_b to available budget in the active layout. col_b can
+   * hold "-> <symlink>" which is unbounded and would otherwise wrap.
+   */
+  if (w_col_b > 0) {
+    int prefix;
+    if (two_line) {
+      /* line 2: tree continuation (4 cols per level) or 2-col indent */
+      prefix = (opts->flat || max_depth_seen == 0) ? 2 : max_depth_seen * 4;
+    } else {
+      prefix = w_name;
+    }
+    int budget = term_w - prefix - meta_fixed - 2; /* 2 = col_b separator */
+    if (budget < 4)
+      budget = 4;
+    if (w_col_b > budget)
+      w_col_b = budget;
+  }
 
-	/* decide whether to page (two-line doubles effective row count) */
-	FILE *out = stdout;
-	FILE *pager = NULL;
+  /* decide whether to page (two-line doubles effective row count) */
+  FILE *out = stdout;
+  FILE *pager = NULL;
 
-	int effective_rows = two_line ? rl->count * 2 : rl->count;
-	if (effective_rows > get_term_height()) {
-		const char *pager_cmd = getenv("PAGER");
-		if (!pager_cmd || !pager_cmd[0])
-			pager_cmd = "less -R";
+  int effective_rows = two_line ? rl->count * 2 : rl->count;
+  if (effective_rows > get_term_height()) {
+    const char *pager_cmd = getenv("PAGER");
+    if (!pager_cmd || !pager_cmd[0])
+      pager_cmd = "less -R";
 
-		signal(SIGPIPE, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
 
-		pager = popen(pager_cmd, "w");
-		if (pager)
-			out = pager;
-	}
+    pager = popen(pager_cmd, "w");
+    if (pager)
+      out = pager;
+  }
 
-	/* print */
-	int tree_continues[MAX_DEPTH] = {0};
-	enum ftype last_type = FT_COUNT; /* sentinel */
+  /* print */
+  int tree_continues[MAX_DEPTH] = {0};
+  enum ftype last_type = FT_COUNT; /* sentinel */
 
-	/* line-2 prefix width when two_line is active (aligns metadata across rows) */
-	int line2_prefix_w = (opts->flat || max_depth_seen == 0)
-	                   ? 2 : max_depth_seen * 4;
+  /* line-2 prefix width when two_line is active (aligns metadata across rows)
+   */
+  int line2_prefix_w =
+      (opts->flat || max_depth_seen == 0) ? 2 : max_depth_seen * 4;
 
-	/*
-	 * Right-align the time column to the terminal edge. Without this,
-	 * leaf rows (no col_b, no col_size) leave a gap where the reserved
-	 * slots stay empty, pushing the time column oddly inward.
-	 */
-	int meta_content = 10; /* perms */
-	if (w_owner > 0) meta_content += 2 + w_owner;
-	if (opts->show_git)
-		meta_content += (w_git > 0) ? 2 + w_git : 3;
-	meta_content += 2 + w_col_a;
-	if (w_col_b > 0) meta_content += 2 + w_col_b;
-	if (w_col_size > 0) meta_content += 2 + w_col_size;
+  /*
+   * Right-align the time column to the terminal edge. Without this,
+   * leaf rows (no col_b, no col_size) leave a gap where the reserved
+   * slots stay empty, pushing the time column oddly inward.
+   */
+  int meta_content = 10; /* perms */
+  if (w_owner > 0)
+    meta_content += 2 + w_owner;
+  if (opts->show_git)
+    meta_content += (w_git > 0) ? 2 + w_git : 3;
+  meta_content += 2 + w_col_a;
+  if (w_col_b > 0)
+    meta_content += 2 + w_col_b;
+  if (w_col_size > 0)
+    meta_content += 2 + w_col_size;
 
-	int time_field = 2 + w_time + 4; /* "  " + time + " ago" */
-	/* single-line writes "  " before perms; meta_content starts at perms (10),
-	 * so subtract that separator here or the row overflows by 2 cols. */
-	int single_time_pad = term_w - w_name - 2 - meta_content - time_field;
-	int two_time_pad = term_w - line2_prefix_w - meta_content - time_field;
-	if (single_time_pad < 0) single_time_pad = 0;
-	if (two_time_pad < 0) two_time_pad = 0;
+  int time_field = 2 + w_time + 4; /* "  " + time + " ago" */
+  /* single-line writes "  " before perms; meta_content starts at perms (10),
+   * so subtract that separator here or the row overflows by 2 cols. */
+  int single_time_pad = term_w - w_name - 2 - meta_content - time_field;
+  int two_time_pad = term_w - line2_prefix_w - meta_content - time_field;
+  if (single_time_pad < 0)
+    single_time_pad = 0;
+  if (two_time_pad < 0)
+    two_time_pad = 0;
 
-	for (int i = 0; i < rl->count; i++) {
-		const row_t *r = &rl->rows[i];
+  for (int i = 0; i < rl->count; i++) {
+    const row_t *r = &rl->rows[i];
 
-		/* type group header when -t is active */
-		if (opts->group_type && r->depth == 0 &&
-		    r->type != last_type) {
-			if (last_type != FT_COUNT)
-				fprintf(out, "\n");
-			fprintf(out, "── %s ──\n", ftype_labels[r->type]);
-			last_type = r->type;
-		}
+    /* type group header when -t is active */
+    if (opts->group_type && r->depth == 0 && r->type != last_type) {
+      if (last_type != FT_COUNT)
+        fprintf(out, "\n");
+      fprintf(out, "── %s ──\n", ftype_labels[r->type]);
+      last_type = r->type;
+    }
 
-		if (!opts->flat) {
-			if (r->depth > 0)
-				tree_continues[r->depth - 1] = !r->is_last;
+    if (!opts->flat) {
+      if (r->depth > 0)
+        tree_continues[r->depth - 1] = !r->is_last;
 
-			/* tree prefix on line 1 */
-			for (int d = 0; d < r->depth; d++) {
-				if (d == r->depth - 1)
-					fprintf(out, "%s ",
-					        r->is_last ? "└─" : "├─");
-				else
-					fprintf(out, "%s   ",
-					        tree_continues[d] ? "│" : " ");
-			}
-		}
+      /* tree prefix on line 1 */
+      for (int d = 0; d < r->depth; d++) {
+        if (d == r->depth - 1)
+          fprintf(out, "%s ", r->is_last ? "└─" : "├─");
+        else
+          fprintf(out, "%s   ", tree_continues[d] ? "│" : " ");
+      }
+    }
 
-		int indent_cols = opts->flat ? 0 : INDENT_COLS(r->depth);
+    int indent_cols = opts->flat ? 0 : INDENT_COLS(r->depth);
 
-		if (two_line) {
-			/* line 1: name only (allowed to use remaining width) */
-			fprintf(out, "%s\n", r->name);
+    if (two_line) {
+      /* line 1: name only (allowed to use remaining width) */
+      fprintf(out, "%s\n", r->name);
 
-			/* line 2: tree continuation + metadata */
-			int written = 0;
-			if (opts->flat || r->depth == 0) {
-				fprintf(out, "  ");
-				written = 2;
-			} else {
-				for (int d = 0; d < r->depth; d++) {
-					fprintf(out, "%s   ",
-					        tree_continues[d] ? "│" : " ");
-					written += 4;
-				}
-			}
-			/* pad to uniform line2_prefix_w so metadata aligns */
-			if (written < line2_prefix_w)
-				fprintf(out, "%*s", line2_prefix_w - written, "");
+      /* line 2: tree continuation + metadata */
+      int written = 0;
+      if (opts->flat || r->depth == 0) {
+        fprintf(out, "  ");
+        written = 2;
+      } else {
+        for (int d = 0; d < r->depth; d++) {
+          fprintf(out, "%s   ", tree_continues[d] ? "│" : " ");
+          written += 4;
+        }
+      }
+      /* pad to uniform line2_prefix_w so metadata aligns */
+      if (written < line2_prefix_w)
+        fprintf(out, "%*s", line2_prefix_w - written, "");
 
-			fprintf(out, "%s", r->perms);
-			if (w_owner > 0)
-				fprintf(out, "  %-*s", w_owner, r->owner);
-			if (opts->show_git) {
-				if (w_git > 0)
-					fprintf(out, "  %*s", w_git, r->git);
-				else
-					fprintf(out, "   ");
-			}
-			fprintf(out, "  %*s", w_col_a, r->col_a);
-			if (w_col_b > 0)
-				print_col_b(out, r, w_col_b);
-			if (w_col_size > 0)
-				fprintf(out, "  %*s", w_col_size, r->col_size);
-			if (r->is_ignored)
-				fprintf(out, "\n");
-			else
-				fprintf(out, "%*s  %*s ago\n",
-				        two_time_pad, "", w_time, r->time);
+      fprintf(out, "%s", r->perms);
+      if (w_owner > 0)
+        fprintf(out, "  %-*s", w_owner, r->owner);
+      if (opts->show_git) {
+        if (w_git > 0)
+          fprintf(out, "  %*s", w_git, r->git);
+        else
+          fprintf(out, "   ");
+      }
+      fprintf(out, "  %*s", w_col_a, r->col_a);
+      if (w_col_b > 0)
+        print_col_b(out, r, w_col_b);
+      if (w_col_size > 0)
+        fprintf(out, "  %*s", w_col_size, r->col_size);
+      if (r->is_ignored)
+        fprintf(out, "\n");
+      else
+        fprintf(out, "%*s  %*s ago\n", two_time_pad, "", w_time, r->time);
 
-			continue;
-		}
+      continue;
+    }
 
-		/* single-line layout */
+    /* single-line layout */
 
-		/* name */
-		int name_pad = w_name - indent_cols - r->name_len;
-		fprintf(out, "%s%*s", r->name,
-		        name_pad > 0 ? name_pad : 0, "");
+    /* name */
+    int name_pad = w_name - indent_cols - r->name_len;
+    fprintf(out, "%s%*s", r->name, name_pad > 0 ? name_pad : 0, "");
 
-		/* permissions */
-		fprintf(out, "  %s", r->perms);
+    /* permissions */
+    fprintf(out, "  %s", r->perms);
 
-		/* owner (only shown if any entry has a different owner) */
-		if (w_owner > 0)
-			fprintf(out, "  %-*s", w_owner, r->owner);
+    /* owner (only shown if any entry has a different owner) */
+    if (w_owner > 0)
+      fprintf(out, "  %-*s", w_owner, r->owner);
 
-		/* git status */
-		if (opts->show_git) {
-			if (w_git > 0)
-				fprintf(out, "  %*s", w_git, r->git);
-			else
-				fprintf(out, "   ");
-		}
+    /* git status */
+    if (opts->show_git) {
+      if (w_git > 0)
+        fprintf(out, "  %*s", w_git, r->git);
+      else
+        fprintf(out, "   ");
+    }
 
-		/* col_a: files count or size */
-		fprintf(out, "  %*s", w_col_a, r->col_a);
+    /* col_a: files count or size */
+    fprintf(out, "  %*s", w_col_a, r->col_a);
 
-		/* col_b: dirs count, or truncated symlink target */
-		if (w_col_b > 0)
-			print_col_b(out, r, w_col_b);
+    /* col_b: dirs count, or truncated symlink target */
+    if (w_col_b > 0)
+      print_col_b(out, r, w_col_b);
 
-		/* subtree size for dirs */
-		if (w_col_size > 0)
-			fprintf(out, "  %*s", w_col_size, r->col_size);
+    /* subtree size for dirs */
+    if (w_col_size > 0)
+      fprintf(out, "  %*s", w_col_size, r->col_size);
 
-		/* time */
-		if (r->is_ignored)
-			fprintf(out, "\n");
-		else
-			fprintf(out, "%*s  %*s ago\n",
-			        single_time_pad, "", w_time, r->time);
-	}
+    /* time */
+    if (r->is_ignored)
+      fprintf(out, "\n");
+    else
+      fprintf(out, "%*s  %*s ago\n", single_time_pad, "", w_time, r->time);
+  }
 
-	if (pager)
-		pclose(pager);
+  if (pager)
+    pclose(pager);
 }
 
-static void print_all(const rowlist_t *rl, const options_t *opts)
-{
-	if (rl->count == 0) return;
+static void print_all(const rowlist_t *rl, const options_t *opts) {
+  if (rl->count == 0)
+    return;
 
-	if (isatty(STDOUT_FILENO))
-		print_pretty(rl, opts);
-	else
-		print_tsv(rl, opts);
+  if (isatty(STDOUT_FILENO))
+    print_pretty(rl, opts);
+  else
+    print_tsv(rl, opts);
 }
 
 /* ── main ──────────────────────────────────────────────────────── */
 
-static void usage(void)
-{
-	fprintf(stderr,
-		"usage: dl [-a] [-d depth] [-f] [-g] [-G] [-t] [directory ...]\n"
-		"\n"
-		"  -a        show dotfiles\n"
-		"  -d N      depth (default: 2)\n"
-		"  -f        flat list, no tree, no recurse\n"
-		"  -g        show git status column\n"
-		"  -G        also hide .gitignore'd entries\n"
-		"  -t        group by file type\n"
-		"  -h        show this help\n"
-	);
-	exit(1);
+static void usage(void) {
+  fprintf(stderr,
+          "usage: dl [-a] [-d depth] [-f] [-g] [-G] [-t] [directory ...]\n"
+          "\n"
+          "  -a        show dotfiles\n"
+          "  -d N      depth (default: 2)\n"
+          "  -f        flat list, no tree, no recurse\n"
+          "  -g        show git status column\n"
+          "  -G        also hide .gitignore'd entries\n"
+          "  -t        group by file type\n"
+          "  -h        show this help\n");
+  exit(1);
 }
 
-int main(int argc, char **argv)
-{
-	options_t opts = {
-		.depth = DEFAULT_DEPTH,
-		.show_all = 0,
-		.flat = 0,
-		.show_git = 0,
-		.use_gitignore = 0,
-		.group_type = 0,
-	};
+int main(int argc, char **argv) {
+  options_t opts = {
+      .depth = DEFAULT_DEPTH,
+      .show_all = 0,
+      .flat = 0,
+      .show_git = 0,
+      .use_gitignore = 0,
+      .group_type = 0,
+  };
 
-	int ch;
-	while ((ch = getopt(argc, argv, "ad:fgGht")) != -1) {
-		switch (ch) {
-		case 'a': opts.show_all = 1; break;
-		case 'd': opts.depth = atoi(optarg); break;
-		case 'f': opts.flat = 1; break;
-		case 'g': opts.show_git = 1; break;
-		case 'G': opts.use_gitignore = 1; break;
-		case 't': opts.group_type = 1; break;
-		case 'h': /* fallthrough */
-		default:  usage();
-		}
-	}
+  int ch;
+  while ((ch = getopt(argc, argv, "ad:fgGht")) != -1) {
+    switch (ch) {
+    case 'a':
+      opts.show_all = 1;
+      break;
+    case 'd':
+      opts.depth = atoi(optarg);
+      break;
+    case 'f':
+      opts.flat = 1;
+      break;
+    case 'g':
+      opts.show_git = 1;
+      break;
+    case 'G':
+      opts.use_gitignore = 1;
+      break;
+    case 't':
+      opts.group_type = 1;
+      break;
+    case 'h': /* fallthrough */
+    default:
+      usage();
+    }
+  }
 
-	argc -= optind;
-	argv += optind;
+  argc -= optind;
+  argv += optind;
 
-	now = time(NULL);
-	current_uid = getuid();
+  now = time(NULL);
+  current_uid = getuid();
 
-	if (opts.show_git)
-		git_map_init();
+  if (opts.show_git)
+    git_map_init();
 
-	rowlist_t rl;
-	rowlist_init(&rl);
+  rowlist_t rl;
+  rowlist_init(&rl);
 
-	int root_nf, root_nd;
-	off_t root_sz;
+  int root_nf, root_nd;
+  off_t root_sz;
 
-	if (argc == 0) {
-		collect(AT_FDCWD, ".", 0, opts.depth, &opts, &rl, "",
-		        &root_nf, &root_nd, &root_sz);
-	} else {
-		for (int i = 0; i < argc; i++) {
-			if (argc > 1)
-				printf("%s:\n", argv[i]);
+  if (argc == 0) {
+    collect(AT_FDCWD, ".", 0, opts.depth, &opts, &rl, "", &root_nf, &root_nd,
+            &root_sz);
+  } else {
+    for (int i = 0; i < argc; i++) {
+      if (argc > 1)
+        printf("%s:\n", argv[i]);
 
-			int fd = open(argv[i], O_RDONLY | O_DIRECTORY);
-			if (fd < 0) {
-				fprintf(stderr, "dl: %s: %s\n",
-				        argv[i], strerror(errno));
-				continue;
-			}
-			collect(fd, ".", 0, opts.depth, &opts, &rl, "",
-			        &root_nf, &root_nd, &root_sz);
-			close(fd);
-		}
-	}
+      int fd = open(argv[i], O_RDONLY | O_DIRECTORY);
+      if (fd < 0) {
+        fprintf(stderr, "dl: %s: %s\n", argv[i], strerror(errno));
+        continue;
+      }
+      collect(fd, ".", 0, opts.depth, &opts, &rl, "", &root_nf, &root_nd,
+              &root_sz);
+      close(fd);
+    }
+  }
 
-	print_all(&rl, &opts);
-	rowlist_free(&rl);
+  print_all(&rl, &opts);
+  rowlist_free(&rl);
 
-	return 0;
+  return 0;
 }
