@@ -173,11 +173,19 @@ typedef struct {
   char perms[12];    /* drwxrwxrwx */
   char owner[32];    /* username if differs from current user, else empty */
   char col_a[32];    /* "N files" for dirs, size for files */
-  char col_b[512];   /* "M dirs", git subject, or symlink target */
+  char col_b[512];   /* "M dirs", git subject (compact -g), or symlink target */
   char col_size[16]; /* total subtree size for dirs, empty for files */
   char git[4];       /* git status char: M, A, ?, D, R, or empty */
   char time[16];     /* relative time */
-  enum ftype type;   /* file type category */
+
+  /* nested-repo columns, populated only for repo rows under -gv */
+  char git_branch[64];
+  char git_track[16]; /* "↑N", "↓N", or "↑N↓N"; empty if up-to-date */
+  char git_hash[16];
+  char git_author[64];
+  char git_subject[256];
+
+  enum ftype type; /* file type category */
   int depth;
   int is_last;
   int is_ignored;
@@ -188,6 +196,11 @@ typedef struct {
   int col_size_len;
   int git_len;
   int time_len;
+  int git_branch_len;
+  int git_track_len;
+  int git_hash_len;
+  int git_author_len;
+  int git_subject_len;
 } row_t;
 
 typedef struct {
@@ -582,93 +595,108 @@ static void git_map_init(const char *target) {
  * Returns status char or 0 if clean/unknown.
  */
 /*
- * Fetch HEAD info of repo at `path` into `out`. Returns 1 on success.
- * Compact form: "<hash> <subject>".
- * Verbose form: "<branch> <hash> <author>: <subject>" (branch omitted if
- * detached HEAD or unreadable). Empty repo / no HEAD → returns 0.
+ * Fetch compact HEAD info of repo at `path` into `out` as
+ * "<short-hash> <subject>". Returns 1 on success.
  */
-static int git_repo_subject(const char *path, char *out, size_t cap,
-                            int verbose) {
+static int git_repo_subject(const char *path, char *out, size_t cap) {
   char qpath[1100];
   shq(path, qpath, sizeof(qpath));
 
   char cmd[2048];
-
-  if (!verbose) {
-    snprintf(cmd, sizeof(cmd),
-             "git -C %s log -1 --pretty='%%h %%s' 2>/dev/null", qpath);
-    FILE *fp = popen(cmd, "r");
-    if (!fp)
-      return 0;
-    int ok = 0;
-    if (fgets(out, cap, fp) != NULL) {
-      size_t len = strlen(out);
-      if (len > 0 && out[len - 1] == '\n')
-        out[len - 1] = '\0';
-      if (out[0])
-        ok = 1;
-    }
-    pclose(fp);
-    return ok;
+  snprintf(cmd, sizeof(cmd), "git -C %s log -1 --pretty='%%h %%s' 2>/dev/null",
+           qpath);
+  FILE *fp = popen(cmd, "r");
+  if (!fp)
+    return 0;
+  int ok = 0;
+  if (fgets(out, cap, fp) != NULL) {
+    size_t len = strlen(out);
+    if (len > 0 && out[len - 1] == '\n')
+      out[len - 1] = '\0';
+    if (out[0])
+      ok = 1;
   }
+  pclose(fp);
+  return ok;
+}
 
-  /* verbose: branch (best-effort) + hash + author + subject */
-  char branch[128] = "";
+/* trim trailing newline in-place */
+static void rtrim_newline(char *s) {
+  size_t l = strlen(s);
+  if (l > 0 && s[l - 1] == '\n')
+    s[l - 1] = '\0';
+}
+
+/*
+ * Fill row's git_branch / git_track / git_hash / git_author / git_subject
+ * for the repo at `path` and update their *_len display widths. Best-effort:
+ * each piece may stay empty if its underlying git call fails.
+ */
+static void git_repo_info_v(const char *path, row_t *r) {
+  char qpath[1100];
+  shq(path, qpath, sizeof(qpath));
+  char cmd[2048];
+
+  /* branch */
   snprintf(cmd, sizeof(cmd),
            "git -C %s rev-parse --abbrev-ref HEAD 2>/dev/null", qpath);
   FILE *fp = popen(cmd, "r");
   if (fp) {
-    if (fgets(branch, sizeof(branch), fp) != NULL) {
-      size_t blen = strlen(branch);
-      if (blen > 0 && branch[blen - 1] == '\n')
-        branch[blen - 1] = '\0';
-      /* detached HEAD reports "HEAD" — drop, hash already follows */
-      if (strcmp(branch, "HEAD") == 0)
-        branch[0] = '\0';
+    if (fgets(r->git_branch, sizeof(r->git_branch), fp) != NULL) {
+      rtrim_newline(r->git_branch);
+      if (strcmp(r->git_branch, "HEAD") == 0)
+        r->git_branch[0] = '\0';
+      r->git_branch_len = display_width(r->git_branch);
     }
     pclose(fp);
   }
 
+  /* hash + author + subject in one log invocation */
   snprintf(cmd, sizeof(cmd),
            "git -C %s log -1 --pretty='%%h%%x09%%an%%x09%%s' 2>/dev/null",
            qpath);
   fp = popen(cmd, "r");
-  if (!fp)
-    return 0;
-
-  char buf[1024];
-  int ok = 0;
-  if (fgets(buf, sizeof(buf), fp) != NULL) {
-    size_t blen = strlen(buf);
-    if (blen > 0 && buf[blen - 1] == '\n')
-      buf[blen - 1] = '\0';
-    if (buf[0])
-      ok = 1;
+  if (fp) {
+    char buf[1024];
+    if (fgets(buf, sizeof(buf), fp) != NULL) {
+      rtrim_newline(buf);
+      char *t1 = strchr(buf, '\t');
+      char *t2 = t1 ? strchr(t1 + 1, '\t') : NULL;
+      if (t1 && t2) {
+        *t1 = '\0';
+        *t2 = '\0';
+        snprintf(r->git_hash, sizeof(r->git_hash), "%s", buf);
+        snprintf(r->git_author, sizeof(r->git_author), "%s", t1 + 1);
+        snprintf(r->git_subject, sizeof(r->git_subject), "%s", t2 + 1);
+        r->git_hash_len = display_width(r->git_hash);
+        r->git_author_len = display_width(r->git_author);
+        r->git_subject_len = display_width(r->git_subject);
+      }
+    }
+    pclose(fp);
   }
-  pclose(fp);
-  if (!ok)
-    return 0;
 
-  char *t1 = strchr(buf, '\t');
-  if (!t1) {
-    snprintf(out, cap, "%s", buf);
-    return 1;
+  /* ahead/behind vs upstream — silent when no upstream tracked */
+  snprintf(cmd, sizeof(cmd),
+           "git -C %s rev-list --left-right --count HEAD...@{u} 2>/dev/null",
+           qpath);
+  fp = popen(cmd, "r");
+  if (fp) {
+    char buf[64];
+    if (fgets(buf, sizeof(buf), fp) != NULL) {
+      int ahead = 0, behind = 0;
+      if (sscanf(buf, "%d %d", &ahead, &behind) == 2 && (ahead || behind)) {
+        if (ahead && behind)
+          snprintf(r->git_track, sizeof(r->git_track), "↑%d↓%d", ahead, behind);
+        else if (ahead)
+          snprintf(r->git_track, sizeof(r->git_track), "↑%d", ahead);
+        else
+          snprintf(r->git_track, sizeof(r->git_track), "↓%d", behind);
+        r->git_track_len = display_width(r->git_track);
+      }
+    }
+    pclose(fp);
   }
-  *t1 = '\0';
-  char *author = t1 + 1;
-  char *t2 = strchr(author, '\t');
-  if (!t2) {
-    snprintf(out, cap, "%s %s", buf, author);
-    return 1;
-  }
-  *t2 = '\0';
-  char *subject = t2 + 1;
-
-  if (branch[0])
-    snprintf(out, cap, "%s %s %s: %s", branch, buf, author, subject);
-  else
-    snprintf(out, cap, "%s %s: %s", buf, author, subject);
-  return 1;
 }
 
 static char git_status_for(const char *relpath) {
@@ -1158,10 +1186,15 @@ static void collect(int parent_fd, const char *dirname, int depth,
         else
           snprintf(fullpath, sizeof(fullpath), "%s/%s", base, e->name);
 
-        char subj[512];
-        if (git_repo_subject(fullpath, subj, sizeof(subj), opts->verbose)) {
-          snprintf(r->col_b, sizeof(r->col_b), "%s", subj);
-          r->col_b_len = display_width(r->col_b);
+        if (opts->verbose) {
+          /* keep col_b at "X dirs"; git info goes to its own columns */
+          git_repo_info_v(fullpath, r);
+        } else {
+          char subj[512];
+          if (git_repo_subject(fullpath, subj, sizeof(subj))) {
+            snprintf(r->col_b, sizeof(r->col_b), "%s", subj);
+            r->col_b_len = display_width(r->col_b);
+          }
         }
       }
     }
@@ -1327,6 +1360,11 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
   int w_col_size = 0;
   int w_git = 0;
   int w_time = 0;
+  int w_git_branch = 0;
+  int w_git_track = 0;
+  int w_git_hash = 0;
+  int w_git_author = 0;
+  int w_git_subject = 0;
   int max_depth_seen = 0;
 
   for (int i = 0; i < rl->count; i++) {
@@ -1346,13 +1384,24 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
       w_git = r->git_len;
     if (r->time_len > w_time)
       w_time = r->time_len;
+    if (r->git_branch_len > w_git_branch)
+      w_git_branch = r->git_branch_len;
+    if (r->git_track_len > w_git_track)
+      w_git_track = r->git_track_len;
+    if (r->git_hash_len > w_git_hash)
+      w_git_hash = r->git_hash_len;
+    if (r->git_author_len > w_git_author)
+      w_git_author = r->git_author_len;
+    if (r->git_subject_len > w_git_subject)
+      w_git_subject = r->git_subject_len;
     if (r->depth > max_depth_seen)
       max_depth_seen = r->depth;
   }
 
   /*
-   * Metadata-only width (everything after the name column, minus col_b).
-   * Reused for single-line col_b budget and two-line layout decision.
+   * Metadata-only width (everything after the name column, minus col_b
+   * and the verbose subject — both treated as variable). Reused for
+   * single-line col_b budget and two-line layout decision.
    */
   int meta_fixed = 2 + 10; /* two spaces + perms */
   if (w_owner > 0)
@@ -1362,38 +1411,70 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
   meta_fixed += 2 + w_col_a;
   if (w_col_size > 0)
     meta_fixed += 2 + w_col_size;
+  if (opts->verbose) {
+    if (w_git_branch > 0)
+      meta_fixed += 2 + w_git_branch;
+    if (w_git_track > 0)
+      meta_fixed += 2 + w_git_track;
+    if (w_git_hash > 0)
+      meta_fixed += 2 + w_git_hash;
+    if (w_git_author > 0)
+      meta_fixed += 2 + w_git_author;
+  }
   meta_fixed += 2 + w_time + 4; /* two spaces + time + " ago" */
 
   int term_w = get_term_width();
 
   /*
    * Adaptive layout: fall back to two-line rendering when a single row
-   * would overflow the terminal. Content-aware — no fixed threshold.
+   * would overflow the terminal. Verbose mode always goes two-line —
+   * the extra columns push almost any real listing past term_w.
    */
   int single_required = w_name + meta_fixed;
   if (w_col_b > 0)
     single_required += 2 + w_col_b;
+  if (w_git_subject > 0)
+    single_required += 2 + w_git_subject;
   int two_line = single_required > term_w;
+  if (opts->verbose && (w_git_branch || w_git_hash || w_git_subject))
+    two_line = 1;
 
   /*
-   * Cap w_col_b to available budget in the active layout. col_b can
-   * hold "-> <symlink>" which is unbounded and would otherwise wrap.
-   * On terms too narrow even for "..." (budget < 4), drop col_b
-   * entirely — forcing a 4-col floor would push every row past term_w.
+   * Cap w_col_b and w_git_subject to available budget. col_b is naturally
+   * short ("X dirs"); subject is the long one in verbose mode and absorbs
+   * the residual. On terms too narrow even for "..." (budget < 4) the
+   * column drops out entirely — forcing a 4-col floor would push every
+   * row past term_w.
    */
+  int layout_prefix = two_line
+                          ? ((opts->flat || max_depth_seen == 0)
+                                 ? 2
+                                 : max_depth_seen * 4)
+                          : w_name;
+  int var_budget = term_w - layout_prefix - meta_fixed;
+  if (w_col_b > 0)
+    var_budget -= 2;
+  if (w_git_subject > 0)
+    var_budget -= 2;
+
   if (w_col_b > 0) {
-    int prefix;
-    if (two_line) {
-      /* line 2: tree continuation (4 cols per level) or 2-col indent */
-      prefix = (opts->flat || max_depth_seen == 0) ? 2 : max_depth_seen * 4;
-    } else {
-      prefix = w_name;
-    }
-    int budget = term_w - prefix - meta_fixed - 2; /* 2 = col_b separator */
-    if (budget < 4)
+    int cap = var_budget;
+    if (cap < 4) {
       w_col_b = 0;
-    else if (w_col_b > budget)
-      w_col_b = budget;
+      var_budget += 2; /* reclaim separator we deducted */
+    } else if (w_col_b > cap) {
+      var_budget -= cap;
+      w_col_b = cap;
+    } else {
+      var_budget -= w_col_b;
+    }
+  }
+  if (w_git_subject > 0) {
+    if (var_budget < 4) {
+      w_git_subject = 0;
+    } else if (w_git_subject > var_budget) {
+      w_git_subject = var_budget;
+    }
   }
 
   /* decide whether to page (two-line doubles effective row count) */
@@ -1438,6 +1519,18 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
   meta_content += 2 + w_col_a;
   if (w_col_b > 0)
     meta_content += 2 + w_col_b;
+  if (opts->verbose) {
+    if (w_git_branch > 0)
+      meta_content += 2 + w_git_branch;
+    if (w_git_track > 0)
+      meta_content += 2 + w_git_track;
+    if (w_git_hash > 0)
+      meta_content += 2 + w_git_hash;
+    if (w_git_author > 0)
+      meta_content += 2 + w_git_author;
+    if (w_git_subject > 0)
+      meta_content += 2 + w_git_subject;
+  }
   if (w_col_size > 0)
     meta_content += 2 + w_col_size;
 
@@ -1508,6 +1601,31 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
       fprintf(out, "  %*s", w_col_a, r->col_a);
       if (w_col_b > 0)
         print_col_b(out, r, w_col_b);
+      if (opts->verbose) {
+        if (w_git_branch > 0)
+          fprintf(out, "  %*s%s",
+                  w_git_branch - r->git_branch_len, "", r->git_branch);
+        if (w_git_track > 0)
+          fprintf(out, "  %*s%s",
+                  w_git_track - r->git_track_len, "", r->git_track);
+        if (w_git_hash > 0)
+          fprintf(out, "  %*s%s",
+                  w_git_hash - r->git_hash_len, "", r->git_hash);
+        if (w_git_author > 0)
+          fprintf(out, "  %*s%s",
+                  w_git_author - r->git_author_len, "", r->git_author);
+        if (w_git_subject > 0) {
+          if (r->git_subject_len <= w_git_subject) {
+            int pad = w_git_subject - r->git_subject_len;
+            fprintf(out, "  %s%*s", r->git_subject, pad, "");
+          } else if (w_git_subject >= 3) {
+            int n = bytes_for_display_cols(r->git_subject, w_git_subject - 3);
+            fprintf(out, "  %.*s...", n, r->git_subject);
+          } else {
+            fprintf(out, "  %.*s", w_git_subject, "...");
+          }
+        }
+      }
       if (w_col_size > 0)
         fprintf(out, "  %*s", w_col_size, r->col_size);
       if (r->is_ignored)
