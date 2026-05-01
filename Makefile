@@ -4,6 +4,9 @@ CFLAGS ?= -Wall -Wextra -Wpedantic -O2 -std=c11 -D_POSIX_C_SOURCE=200809L -D_DAR
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
+CLANG_FORMAT ?= clang-format
+SOURCES      := dl.c
+
 dl: dl.c
 	$(CC) $(CFLAGS) -o $@ $<
 
@@ -17,4 +20,10 @@ install: dl
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/dl
 
-.PHONY: clean install uninstall
+fmt:
+	$(CLANG_FORMAT) -i $(SOURCES)
+
+fmt-check:
+	$(CLANG_FORMAT) --dry-run --Werror $(SOURCES)
+
+.PHONY: clean install uninstall fmt fmt-check
