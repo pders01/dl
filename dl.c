@@ -201,6 +201,8 @@ typedef struct {
   int show_git;      /* -g: show git status column */
   int use_gitignore; /* -G: also read .gitignore */
   int group_type;    /* -t: group by file type */
+  const char
+      *target_path; /* current listing target, for path-relative git ops */
 } options_t;
 
 /* ── git status map (simple linear scan, fine for project sizes) ── */
@@ -213,8 +215,25 @@ typedef struct {
 typedef struct {
   git_entry_t entries[GIT_MAP_SIZE];
   int count;
-  int active;     /* whether git is available */
-  char root[512]; /* git repo root */
+  int active;       /* whether git is available */
+  char root[512];   /* git repo root */
+  char prefix[512]; /* listing target offset within repo, no trailing slash */
+
+  /* banner data */
+  char branch[128];
+  char head_hash[16];
+  char head_subject[256];
+  int ahead;
+  int behind;
+  int has_upstream;
+
+  /* footer counters */
+  int n_modified;
+  int n_untracked;
+  int n_added;
+  int n_deleted;
+  int n_renamed;
+  int n_unmerged;
 } git_map_t;
 
 /* ── globals ───────────────────────────────────────────────────── */
@@ -234,9 +253,9 @@ static int is_ignored(const char *name) {
 }
 
 static void fmt_size(off_t bytes, char *buf, size_t bufsz) {
-  const char *units[] = {"B", "K", "M", "G", "T"};
-  int u = 0;
+  static const char *units[] = {"B", "K", "M", "G", "T"};
   double sz = (double)bytes;
+  int u = 0;
 
   while (sz >= 1000.0 && u < 4) {
     sz /= 1024.0;
@@ -288,11 +307,41 @@ static void fmt_perms(mode_t mode, char *buf) {
 
 /* ── git status ────────────────────────────────────────────────── */
 
-static void git_map_init(void) {
+/* shell-escape target path for popen. Single-quote, escape embedded quotes. */
+static void shq(const char *in, char *out, size_t cap) {
+  size_t o = 0;
+  if (o < cap)
+    out[o++] = '\'';
+  for (size_t i = 0; in[i] && o + 4 < cap; i++) {
+    if (in[i] == '\'') {
+      out[o++] = '\'';
+      out[o++] = '\\';
+      out[o++] = '\'';
+      out[o++] = '\'';
+    } else {
+      out[o++] = in[i];
+    }
+  }
+  if (o < cap)
+    out[o++] = '\'';
+  if (o < cap)
+    out[o] = '\0';
+  else
+    out[cap - 1] = '\0';
+}
+
+static void git_map_init(const char *target) {
   memset(&git_map, 0, sizeof(git_map));
 
-  /* find git root */
-  FILE *fp = popen("git rev-parse --show-toplevel 2>/dev/null", "r");
+  char qtarget[1100];
+  shq(target, qtarget, sizeof(qtarget));
+
+  char cmd[2048];
+
+  /* find git root (run from target, not cwd) */
+  snprintf(cmd, sizeof(cmd), "git -C %s rev-parse --show-toplevel 2>/dev/null",
+           qtarget);
+  FILE *fp = popen(cmd, "r");
   if (!fp)
     return;
 
@@ -307,8 +356,77 @@ static void git_map_init(void) {
   if (len > 0 && git_map.root[len - 1] == '\n')
     git_map.root[len - 1] = '\0';
 
+  /* offset from repo root to listing target (porcelain paths are repo-rooted)
+   */
+  snprintf(cmd, sizeof(cmd), "git -C %s rev-parse --show-prefix 2>/dev/null",
+           qtarget);
+  fp = popen(cmd, "r");
+  if (fp) {
+    if (fgets(git_map.prefix, sizeof(git_map.prefix), fp) != NULL) {
+      size_t plen = strlen(git_map.prefix);
+      if (plen > 0 && git_map.prefix[plen - 1] == '\n') {
+        git_map.prefix[--plen] = '\0';
+      }
+      /* drop trailing slash for uniform join in lookup */
+      if (plen > 0 && git_map.prefix[plen - 1] == '/')
+        git_map.prefix[plen - 1] = '\0';
+    }
+    pclose(fp);
+  }
+
+  /* branch */
+  snprintf(cmd, sizeof(cmd),
+           "git -C %s rev-parse --abbrev-ref HEAD 2>/dev/null", qtarget);
+  fp = popen(cmd, "r");
+  if (fp) {
+    if (fgets(git_map.branch, sizeof(git_map.branch), fp) != NULL) {
+      size_t blen = strlen(git_map.branch);
+      if (blen > 0 && git_map.branch[blen - 1] == '\n')
+        git_map.branch[blen - 1] = '\0';
+    }
+    pclose(fp);
+  }
+
+  /* HEAD hash + subject */
+  snprintf(cmd, sizeof(cmd),
+           "git -C %s log -1 --pretty='%%h%%x09%%s' 2>/dev/null", qtarget);
+  fp = popen(cmd, "r");
+  if (fp) {
+    char buf[512];
+    if (fgets(buf, sizeof(buf), fp) != NULL) {
+      size_t blen = strlen(buf);
+      if (blen > 0 && buf[blen - 1] == '\n')
+        buf[blen - 1] = '\0';
+      char *tab = strchr(buf, '\t');
+      if (tab) {
+        *tab = '\0';
+        snprintf(git_map.head_hash, sizeof(git_map.head_hash), "%s", buf);
+        snprintf(git_map.head_subject, sizeof(git_map.head_subject), "%s",
+                 tab + 1);
+      }
+    }
+    pclose(fp);
+  }
+
+  /* ahead / behind upstream */
+  snprintf(cmd, sizeof(cmd),
+           "git -C %s rev-list --left-right --count "
+           "HEAD...@{u} 2>/dev/null",
+           qtarget);
+  fp = popen(cmd, "r");
+  if (fp) {
+    char buf[64];
+    if (fgets(buf, sizeof(buf), fp) != NULL) {
+      if (sscanf(buf, "%d %d", &git_map.ahead, &git_map.behind) == 2)
+        git_map.has_upstream = 1;
+    }
+    pclose(fp);
+  }
+
   /* get status */
-  fp = popen("git status --porcelain 2>/dev/null", "r");
+  snprintf(cmd, sizeof(cmd), "git -C %s status --porcelain 2>/dev/null",
+           qtarget);
+  fp = popen(cmd, "r");
   if (!fp)
     return;
 
@@ -334,28 +452,35 @@ static void git_map_init(void) {
     else
       continue;
 
-    /* map to single meaningful char */
+    /* map to single meaningful char + tally */
     switch (ge->status) {
     case '?':
       ge->status = '?';
+      git_map.n_untracked++;
       break;
     case 'M':
       ge->status = 'M';
+      git_map.n_modified++;
       break;
     case 'A':
       ge->status = 'A';
+      git_map.n_added++;
       break;
     case 'D':
       ge->status = 'D';
+      git_map.n_deleted++;
       break;
     case 'R':
       ge->status = 'R';
+      git_map.n_renamed++;
       break;
     case 'C':
       ge->status = 'C';
+      git_map.n_added++;
       break;
     case 'U':
       ge->status = 'U';
+      git_map.n_unmerged++;
       break;
     default:
       ge->status = '~';
@@ -387,18 +512,55 @@ static void git_map_init(void) {
  * Look up git status for a path relative to cwd.
  * Returns status char or 0 if clean/unknown.
  */
+/*
+ * Fetch HEAD subject of repo at `path` into `out`. Returns 1 on success.
+ * Format: "<short-hash> <subject>". Empty repo / no HEAD → returns 0.
+ */
+static int git_repo_subject(const char *path, char *out, size_t cap) {
+  char qpath[1100];
+  shq(path, qpath, sizeof(qpath));
+
+  char cmd[2048];
+  snprintf(cmd, sizeof(cmd), "git -C %s log -1 --pretty='%%h %%s' 2>/dev/null",
+           qpath);
+
+  FILE *fp = popen(cmd, "r");
+  if (!fp)
+    return 0;
+
+  int ok = 0;
+  if (fgets(out, cap, fp) != NULL) {
+    size_t len = strlen(out);
+    if (len > 0 && out[len - 1] == '\n')
+      out[len - 1] = '\0';
+    if (out[0])
+      ok = 1;
+  }
+  pclose(fp);
+  return ok;
+}
+
 static char git_status_for(const char *relpath) {
   if (!git_map.active)
     return 0;
 
+  /* porcelain paths are repo-root relative; relpath is target-relative.
+   * Join target offset (prefix) with relpath to form a repo-rooted key. */
+  char key[1024];
+  if (git_map.prefix[0] && relpath[0])
+    snprintf(key, sizeof(key), "%s/%s", git_map.prefix, relpath);
+  else if (git_map.prefix[0])
+    snprintf(key, sizeof(key), "%s", git_map.prefix);
+  else
+    snprintf(key, sizeof(key), "%s", relpath);
+
+  size_t klen = strlen(key);
   for (int i = 0; i < git_map.count; i++) {
-    /* exact match */
-    if (strcmp(git_map.entries[i].path, relpath) == 0)
+    if (strcmp(git_map.entries[i].path, key) == 0)
       return git_map.entries[i].status;
     /* directory prefix match (any file under this dir is dirty) */
-    size_t rlen = strlen(relpath);
-    if (strncmp(git_map.entries[i].path, relpath, rlen) == 0 &&
-        git_map.entries[i].path[rlen] == '/')
+    if (klen > 0 && strncmp(git_map.entries[i].path, key, klen) == 0 &&
+        git_map.entries[i].path[klen] == '/')
       return git_map.entries[i].status;
   }
   return 0;
@@ -742,6 +904,29 @@ static void collect(int parent_fd, const char *dirname, int depth,
       r->col_size_len = (int)strlen(r->col_size);
     }
 
+    /* if entry is a repo root, replace col_b with HEAD subject.
+     * Detect via .git existing inside (dir for normal repos,
+     * file for submodules and worktrees). */
+    if (opts->show_git && !e->is_ignored) {
+      struct stat gst;
+      char probe[512];
+      snprintf(probe, sizeof(probe), "%s/.git", e->name);
+      if (fstatat(fd2, probe, &gst, 0) == 0) {
+        char fullpath[2048];
+        const char *base = opts->target_path ? opts->target_path : ".";
+        if (relpath[0])
+          snprintf(fullpath, sizeof(fullpath), "%s/%s/%s", base, relpath,
+                   e->name);
+        else
+          snprintf(fullpath, sizeof(fullpath), "%s/%s", base, e->name);
+
+        char subj[512];
+        if (git_repo_subject(fullpath, subj, sizeof(subj))) {
+          r->col_b_len = snprintf(r->col_b, sizeof(r->col_b), "%s", subj);
+        }
+      }
+    }
+
     (*out_size) += sub_sz;
   }
 
@@ -797,6 +982,71 @@ static void print_col_b(FILE *out, const row_t *r, int budget) {
     fprintf(out, "  %.*s...", budget - 3, r->col_b);
   else
     fprintf(out, "  %.*s", budget, "...");
+}
+
+static void print_git_banner(FILE *out) {
+  if (!git_map.active)
+    return;
+
+  const char *base = git_map.root;
+  const char *slash = strrchr(git_map.root, '/');
+  if (slash && slash[1])
+    base = slash + 1;
+
+  fprintf(out, "repo %s", base);
+  if (git_map.branch[0])
+    fprintf(out, " · %s", git_map.branch);
+  if (git_map.has_upstream && (git_map.ahead || git_map.behind)) {
+    fprintf(out, " [");
+    int wrote = 0;
+    if (git_map.ahead) {
+      fprintf(out, "↑%d", git_map.ahead);
+      wrote = 1;
+    }
+    if (git_map.behind) {
+      fprintf(out, "%s↓%d", wrote ? " " : "", git_map.behind);
+    }
+    fprintf(out, "]");
+  }
+  if (git_map.head_hash[0])
+    fprintf(out, " · %s %s", git_map.head_hash, git_map.head_subject);
+  fprintf(out, "\n");
+}
+
+static void print_git_footer(FILE *out) {
+  if (!git_map.active)
+    return;
+
+  int total = git_map.n_modified + git_map.n_untracked + git_map.n_added +
+              git_map.n_deleted + git_map.n_renamed + git_map.n_unmerged;
+  if (total == 0 &&
+      !(git_map.has_upstream && (git_map.ahead || git_map.behind)))
+    return;
+
+  fprintf(out, "\n");
+  int wrote = 0;
+#define EMIT(label, n)                                                         \
+  do {                                                                         \
+    if ((n) > 0) {                                                             \
+      fprintf(out, "%s%d %s", wrote ? ", " : "", (n), label);                  \
+      wrote = 1;                                                               \
+    }                                                                          \
+  } while (0)
+
+  EMIT("modified", git_map.n_modified);
+  EMIT("added", git_map.n_added);
+  EMIT("deleted", git_map.n_deleted);
+  EMIT("renamed", git_map.n_renamed);
+  EMIT("untracked", git_map.n_untracked);
+  EMIT("unmerged", git_map.n_unmerged);
+#undef EMIT
+
+  if (git_map.has_upstream && git_map.ahead)
+    fprintf(out, "%sahead %d", wrote ? ", " : "", git_map.ahead);
+  if (git_map.has_upstream && git_map.behind)
+    fprintf(out, ", behind %d", git_map.behind);
+
+  fprintf(out, "\n");
 }
 
 static void print_pretty(const rowlist_t *rl, const options_t *opts) {
@@ -896,6 +1146,9 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
     if (pager)
       out = pager;
   }
+
+  if (opts->show_git)
+    print_git_banner(out);
 
   /* print */
   int tree_continues[MAX_DEPTH] = {0};
@@ -1038,6 +1291,9 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
       fprintf(out, "%*s  %*s ago\n", single_time_pad, "", w_time, r->time);
   }
 
+  if (opts->show_git)
+    print_git_footer(out);
+
   if (pager)
     pclose(pager);
 }
@@ -1111,9 +1367,6 @@ int main(int argc, char **argv) {
   now = time(NULL);
   current_uid = getuid();
 
-  if (opts.show_git)
-    git_map_init();
-
   rowlist_t rl;
   rowlist_init(&rl);
 
@@ -1121,6 +1374,9 @@ int main(int argc, char **argv) {
   off_t root_sz;
 
   if (argc == 0) {
+    opts.target_path = ".";
+    if (opts.show_git)
+      git_map_init(".");
     collect(AT_FDCWD, ".", 0, opts.depth, &opts, &rl, "", &root_nf, &root_nd,
             &root_sz);
   } else {
@@ -1133,6 +1389,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "dl: %s: %s\n", argv[i], strerror(errno));
         continue;
       }
+      opts.target_path = argv[i];
+      if (opts.show_git)
+        git_map_init(argv[i]);
       collect(fd, ".", 0, opts.depth, &opts, &rl, "", &root_nf, &root_nd,
               &root_sz);
       close(fd);
