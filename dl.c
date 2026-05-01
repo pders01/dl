@@ -203,6 +203,7 @@ typedef struct {
   int show_git;      /* -g: show git status column */
   int use_gitignore; /* -G: also read .gitignore */
   int group_type;    /* -t: group by file type */
+  int verbose;       /* -v: nested repos show branch + author too */
   const char
       *target_path; /* current listing target, for path-relative git ops */
 } options_t;
@@ -581,31 +582,93 @@ static void git_map_init(const char *target) {
  * Returns status char or 0 if clean/unknown.
  */
 /*
- * Fetch HEAD subject of repo at `path` into `out`. Returns 1 on success.
- * Format: "<short-hash> <subject>". Empty repo / no HEAD → returns 0.
+ * Fetch HEAD info of repo at `path` into `out`. Returns 1 on success.
+ * Compact form: "<hash> <subject>".
+ * Verbose form: "<branch> <hash> <author>: <subject>" (branch omitted if
+ * detached HEAD or unreadable). Empty repo / no HEAD → returns 0.
  */
-static int git_repo_subject(const char *path, char *out, size_t cap) {
+static int git_repo_subject(const char *path, char *out, size_t cap,
+                            int verbose) {
   char qpath[1100];
   shq(path, qpath, sizeof(qpath));
 
   char cmd[2048];
-  snprintf(cmd, sizeof(cmd), "git -C %s log -1 --pretty='%%h %%s' 2>/dev/null",
-           qpath);
 
+  if (!verbose) {
+    snprintf(cmd, sizeof(cmd),
+             "git -C %s log -1 --pretty='%%h %%s' 2>/dev/null", qpath);
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+      return 0;
+    int ok = 0;
+    if (fgets(out, cap, fp) != NULL) {
+      size_t len = strlen(out);
+      if (len > 0 && out[len - 1] == '\n')
+        out[len - 1] = '\0';
+      if (out[0])
+        ok = 1;
+    }
+    pclose(fp);
+    return ok;
+  }
+
+  /* verbose: branch (best-effort) + hash + author + subject */
+  char branch[128] = "";
+  snprintf(cmd, sizeof(cmd),
+           "git -C %s rev-parse --abbrev-ref HEAD 2>/dev/null", qpath);
   FILE *fp = popen(cmd, "r");
+  if (fp) {
+    if (fgets(branch, sizeof(branch), fp) != NULL) {
+      size_t blen = strlen(branch);
+      if (blen > 0 && branch[blen - 1] == '\n')
+        branch[blen - 1] = '\0';
+      /* detached HEAD reports "HEAD" — drop, hash already follows */
+      if (strcmp(branch, "HEAD") == 0)
+        branch[0] = '\0';
+    }
+    pclose(fp);
+  }
+
+  snprintf(cmd, sizeof(cmd),
+           "git -C %s log -1 --pretty='%%h%%x09%%an%%x09%%s' 2>/dev/null",
+           qpath);
+  fp = popen(cmd, "r");
   if (!fp)
     return 0;
 
+  char buf[1024];
   int ok = 0;
-  if (fgets(out, cap, fp) != NULL) {
-    size_t len = strlen(out);
-    if (len > 0 && out[len - 1] == '\n')
-      out[len - 1] = '\0';
-    if (out[0])
+  if (fgets(buf, sizeof(buf), fp) != NULL) {
+    size_t blen = strlen(buf);
+    if (blen > 0 && buf[blen - 1] == '\n')
+      buf[blen - 1] = '\0';
+    if (buf[0])
       ok = 1;
   }
   pclose(fp);
-  return ok;
+  if (!ok)
+    return 0;
+
+  char *t1 = strchr(buf, '\t');
+  if (!t1) {
+    snprintf(out, cap, "%s", buf);
+    return 1;
+  }
+  *t1 = '\0';
+  char *author = t1 + 1;
+  char *t2 = strchr(author, '\t');
+  if (!t2) {
+    snprintf(out, cap, "%s %s", buf, author);
+    return 1;
+  }
+  *t2 = '\0';
+  char *subject = t2 + 1;
+
+  if (branch[0])
+    snprintf(out, cap, "%s %s %s: %s", branch, buf, author, subject);
+  else
+    snprintf(out, cap, "%s %s: %s", buf, author, subject);
+  return 1;
 }
 
 static char git_status_for(const char *relpath) {
@@ -1096,7 +1159,7 @@ static void collect(int parent_fd, const char *dirname, int depth,
           snprintf(fullpath, sizeof(fullpath), "%s/%s", base, e->name);
 
         char subj[512];
-        if (git_repo_subject(fullpath, subj, sizeof(subj))) {
+        if (git_repo_subject(fullpath, subj, sizeof(subj), opts->verbose)) {
           snprintf(r->col_b, sizeof(r->col_b), "%s", subj);
           r->col_b_len = display_width(r->col_b);
         }
@@ -1493,15 +1556,17 @@ static void print_all(const rowlist_t *rl, const options_t *opts) {
 
 static void usage(int code) {
   FILE *out = code == 0 ? stdout : stderr;
-  fprintf(out, "usage: dl [-a] [-d depth] [-f] [-g] [-G] [-t] [directory ...]\n"
-               "\n"
-               "  -a        show dotfiles\n"
-               "  -d N      depth (default: 2, min: 1)\n"
-               "  -f        flat list, no tree, no recurse\n"
-               "  -g        show git status column\n"
-               "  -G        also hide .gitignore'd entries\n"
-               "  -t        group by file type\n"
-               "  -h        show this help\n");
+  fprintf(out,
+          "usage: dl [-a] [-d depth] [-f] [-g] [-G] [-t] [-v] [directory ...]\n"
+          "\n"
+          "  -a        show dotfiles\n"
+          "  -d N      depth (default: 2, min: 1)\n"
+          "  -f        flat list, no tree, no recurse\n"
+          "  -g        show git status column\n"
+          "  -G        also hide .gitignore'd entries\n"
+          "  -t        group by file type\n"
+          "  -v        verbose: nested repos show branch + author\n"
+          "  -h        show this help\n");
   exit(code);
 }
 
@@ -1515,10 +1580,11 @@ int main(int argc, char **argv) {
       .show_git = 0,
       .use_gitignore = 0,
       .group_type = 0,
+      .verbose = 0,
   };
 
   int ch;
-  while ((ch = getopt(argc, argv, "ad:fgGht")) != -1) {
+  while ((ch = getopt(argc, argv, "ad:fgGhtv")) != -1) {
     switch (ch) {
     case 'a':
       opts.show_all = 1;
@@ -1545,6 +1611,9 @@ int main(int argc, char **argv) {
       break;
     case 't':
       opts.group_type = 1;
+      break;
+    case 'v':
+      opts.verbose = 1;
       break;
     case 'h':
       usage(0);
