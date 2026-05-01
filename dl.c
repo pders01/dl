@@ -171,7 +171,7 @@ typedef struct {
   char perms[12];    /* drwxrwxrwx */
   char owner[32];    /* username if differs from current user, else empty */
   char col_a[32];    /* "N files" for dirs, size for files */
-  char col_b[32];    /* "M dirs" for dirs, blank for files */
+  char col_b[512];   /* "M dirs", git subject, or symlink target */
   char col_size[16]; /* total subtree size for dirs, empty for files */
   char git[4];       /* git status char: M, A, ?, D, R, or empty */
   char time[16];     /* relative time */
@@ -299,6 +299,13 @@ static void fmt_reltime(time_t mtime, char *buf, size_t bufsz) {
     snprintf(buf, bufsz, "%ldmo", diff / (86400 * 30));
   else
     snprintf(buf, bufsz, "%ldy", diff / (86400 * 365));
+}
+
+/* clamp snprintf return value to chars actually stored (cap-1 on overflow) */
+static int sn_stored_len(int n, size_t cap) {
+  if (n < 0)
+    return 0;
+  return (size_t)n >= cap ? (int)cap - 1 : n;
 }
 
 static void fmt_perms(mode_t mode, char *buf) {
@@ -942,8 +949,8 @@ static void collect(int parent_fd, const char *dirname, int depth,
     }
 
     if (e->is_link && e->link_target[0]) {
-      r->col_b_len =
-          snprintf(r->col_b, sizeof(r->col_b), "-> %s", e->link_target);
+      int n = snprintf(r->col_b, sizeof(r->col_b), "-> %s", e->link_target);
+      r->col_b_len = sn_stored_len(n, sizeof(r->col_b));
     }
 
     /* git status */
@@ -1011,7 +1018,8 @@ static void collect(int parent_fd, const char *dirname, int depth,
       r->col_a_len = snprintf(r->col_a, sizeof(r->col_a), "%d files", sub_nf);
     }
     if (sub_nd > 0) {
-      r->col_b_len = snprintf(r->col_b, sizeof(r->col_b), "%d dirs", sub_nd);
+      int n = snprintf(r->col_b, sizeof(r->col_b), "%d dirs", sub_nd);
+      r->col_b_len = sn_stored_len(n, sizeof(r->col_b));
     }
     if (sub_sz > 0) {
       fmt_size(sub_sz, r->col_size, sizeof(r->col_size));
@@ -1036,7 +1044,8 @@ static void collect(int parent_fd, const char *dirname, int depth,
 
         char subj[512];
         if (git_repo_subject(fullpath, subj, sizeof(subj))) {
-          r->col_b_len = snprintf(r->col_b, sizeof(r->col_b), "%s", subj);
+          int n = snprintf(r->col_b, sizeof(r->col_b), "%s", subj);
+          r->col_b_len = sn_stored_len(n, sizeof(r->col_b));
         }
       }
     }
