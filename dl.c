@@ -1424,18 +1424,18 @@ static void print_all(const rowlist_t *rl, const options_t *opts) {
 
 /* ── main ──────────────────────────────────────────────────────── */
 
-static void usage(void) {
-  fprintf(stderr,
-          "usage: dl [-a] [-d depth] [-f] [-g] [-G] [-t] [directory ...]\n"
-          "\n"
-          "  -a        show dotfiles\n"
-          "  -d N      depth (default: 2)\n"
-          "  -f        flat list, no tree, no recurse\n"
-          "  -g        show git status column\n"
-          "  -G        also hide .gitignore'd entries\n"
-          "  -t        group by file type\n"
-          "  -h        show this help\n");
-  exit(1);
+static void usage(int code) {
+  FILE *out = code == 0 ? stdout : stderr;
+  fprintf(out, "usage: dl [-a] [-d depth] [-f] [-g] [-G] [-t] [directory ...]\n"
+               "\n"
+               "  -a        show dotfiles\n"
+               "  -d N      depth (default: 2, min: 1)\n"
+               "  -f        flat list, no tree, no recurse\n"
+               "  -g        show git status column\n"
+               "  -G        also hide .gitignore'd entries\n"
+               "  -t        group by file type\n"
+               "  -h        show this help\n");
+  exit(code);
 }
 
 int main(int argc, char **argv) {
@@ -1454,9 +1454,17 @@ int main(int argc, char **argv) {
     case 'a':
       opts.show_all = 1;
       break;
-    case 'd':
-      opts.depth = atoi(optarg);
+    case 'd': {
+      char *end;
+      long n = strtol(optarg, &end, 10);
+      if (end == optarg || *end != '\0' || n < 1 || n > MAX_DEPTH) {
+        fprintf(stderr, "dl: -d requires an integer in 1..%d, got: %s\n",
+                MAX_DEPTH, optarg);
+        exit(1);
+      }
+      opts.depth = (int)n;
       break;
+    }
     case 'f':
       opts.flat = 1;
       break;
@@ -1469,9 +1477,10 @@ int main(int argc, char **argv) {
     case 't':
       opts.group_type = 1;
       break;
-    case 'h': /* fallthrough */
+    case 'h':
+      usage(0);
     default:
-      usage();
+      usage(1);
     }
   }
 
