@@ -236,11 +236,21 @@ typedef struct {
   int n_unmerged;
 } git_map_t;
 
+/* ── gitignore set (entries hidden by `-G`) ─────────────────────── */
+
+typedef struct {
+  char paths[GIT_MAP_SIZE][512];
+  int count;
+  int active;
+  char prefix[512]; /* listing target offset within repo */
+} gitignore_set_t;
+
 /* ── globals ───────────────────────────────────────────────────── */
 
 static time_t now;
 static uid_t current_uid;
 static git_map_t git_map;
+static gitignore_set_t gi_set;
 
 /* ── helpers ───────────────────────────────────────────────────── */
 
@@ -566,6 +576,97 @@ static char git_status_for(const char *relpath) {
   return 0;
 }
 
+/* ── gitignore set ─────────────────────────────────────────────── */
+
+/*
+ * Populate `gi_set` with paths git would consider ignored under `target`.
+ * Uses `git ls-files -o -i --exclude-standard --directory` (untracked +
+ * ignored, dirs collapsed). Tracked files matching .gitignore are not
+ * reported — git does not consider them ignored.
+ */
+static void gitignore_init(const char *target) {
+  memset(&gi_set, 0, sizeof(gi_set));
+
+  char qtarget[1100];
+  shq(target, qtarget, sizeof(qtarget));
+
+  char cmd[2048];
+
+  /* prefix (target offset within repo) for lookup-key joining */
+  snprintf(cmd, sizeof(cmd), "git -C %s rev-parse --show-prefix 2>/dev/null",
+           qtarget);
+  FILE *fp = popen(cmd, "r");
+  if (fp) {
+    if (fgets(gi_set.prefix, sizeof(gi_set.prefix), fp) != NULL) {
+      size_t plen = strlen(gi_set.prefix);
+      if (plen > 0 && gi_set.prefix[plen - 1] == '\n')
+        gi_set.prefix[--plen] = '\0';
+      if (plen > 0 && gi_set.prefix[plen - 1] == '/')
+        gi_set.prefix[plen - 1] = '\0';
+    }
+    pclose(fp);
+  }
+
+  snprintf(cmd, sizeof(cmd),
+           "git -C %s ls-files -o -i --exclude-standard --directory "
+           "2>/dev/null",
+           qtarget);
+  fp = popen(cmd, "r");
+  if (!fp)
+    return;
+
+  char line[1024];
+  while (fgets(line, sizeof(line), fp) && gi_set.count < GIT_MAP_SIZE) {
+    size_t llen = strlen(line);
+    if (llen == 0)
+      continue;
+    if (line[llen - 1] == '\n')
+      line[--llen] = '\0';
+    if (llen == 0)
+      continue;
+    /* git emits collapsed dirs with trailing slash — strip for uniform match */
+    if (line[llen - 1] == '/')
+      line[--llen] = '\0';
+    if (llen == 0)
+      continue;
+    strncpy(gi_set.paths[gi_set.count], line,
+            sizeof(gi_set.paths[gi_set.count]) - 1);
+    gi_set.count++;
+    gi_set.active = 1;
+  }
+  pclose(fp);
+}
+
+/*
+ * Return 1 if `relpath` (target-relative) matches an ignored path or sits
+ * under one. Lookup key joined with target prefix to match repo-rooted
+ * paths from `git ls-files`.
+ */
+static int is_gitignored(const char *relpath) {
+  if (!gi_set.active)
+    return 0;
+
+  char key[1024];
+  if (gi_set.prefix[0] && relpath[0])
+    snprintf(key, sizeof(key), "%s/%s", gi_set.prefix, relpath);
+  else if (gi_set.prefix[0])
+    snprintf(key, sizeof(key), "%s", gi_set.prefix);
+  else
+    snprintf(key, sizeof(key), "%s", relpath);
+
+  size_t klen = strlen(key);
+  for (int i = 0; i < gi_set.count; i++) {
+    const char *p = gi_set.paths[i];
+    size_t plen = strlen(p);
+    if (plen == klen && strcmp(p, key) == 0)
+      return 1;
+    /* key sits under an ignored ancestor */
+    if (plen < klen && strncmp(p, key, plen) == 0 && key[plen] == '/')
+      return 1;
+  }
+  return 0;
+}
+
 /* ── owner lookup ──────────────────────────────────────────────── */
 
 static const char *owner_name(uid_t uid) {
@@ -751,6 +852,17 @@ static void collect(int parent_fd, const char *dirname, int depth,
 
     if (!opts->show_all && de->d_name[0] == '.')
       continue;
+
+    if (opts->use_gitignore) {
+      char entry_relpath[1024];
+      if (relpath[0])
+        snprintf(entry_relpath, sizeof(entry_relpath), "%s/%s", relpath,
+                 de->d_name);
+      else
+        snprintf(entry_relpath, sizeof(entry_relpath), "%s", de->d_name);
+      if (is_gitignored(entry_relpath))
+        continue;
+    }
 
     entry_t *e = &entries[n];
     memset(e, 0, sizeof(*e));
@@ -1377,6 +1489,8 @@ int main(int argc, char **argv) {
     opts.target_path = ".";
     if (opts.show_git)
       git_map_init(".");
+    if (opts.use_gitignore)
+      gitignore_init(".");
     collect(AT_FDCWD, ".", 0, opts.depth, &opts, &rl, "", &root_nf, &root_nd,
             &root_sz);
   } else {
@@ -1392,6 +1506,8 @@ int main(int argc, char **argv) {
       opts.target_path = argv[i];
       if (opts.show_git)
         git_map_init(argv[i]);
+      if (opts.use_gitignore)
+        gitignore_init(argv[i]);
       collect(fd, ".", 0, opts.depth, &opts, &rl, "", &root_nf, &root_nd,
               &root_sz);
       close(fd);
