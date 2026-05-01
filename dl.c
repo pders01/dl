@@ -1228,7 +1228,7 @@ static void print_col_b(FILE *out, const row_t *r, int budget) {
   }
 }
 
-static void print_git_banner(FILE *out) {
+static void print_git_banner(FILE *out, int term_w) {
   if (!git_map.active)
     return;
 
@@ -1237,24 +1237,44 @@ static void print_git_banner(FILE *out) {
   if (slash && slash[1])
     base = slash + 1;
 
-  fprintf(out, "repo %s", base);
+  /* assemble into buffer so we can measure and truncate before emit */
+  char buf[1024];
+  size_t cap = sizeof(buf);
+  int o = 0;
+#define APPEND(...)                                                            \
+  do {                                                                         \
+    int _n = snprintf(buf + o, cap - (size_t)o, __VA_ARGS__);                  \
+    if (_n < 0 || (size_t)_n >= cap - (size_t)o)                               \
+      o = (int)cap - 1;                                                        \
+    else                                                                       \
+      o += _n;                                                                 \
+  } while (0)
+
+  APPEND("repo %s", base);
   if (git_map.branch[0])
-    fprintf(out, " · %s", git_map.branch);
+    APPEND(" · %s", git_map.branch);
   if (git_map.has_upstream && (git_map.ahead || git_map.behind)) {
-    fprintf(out, " [");
+    APPEND(" [");
     int wrote = 0;
     if (git_map.ahead) {
-      fprintf(out, "↑%d", git_map.ahead);
+      APPEND("↑%d", git_map.ahead);
       wrote = 1;
     }
-    if (git_map.behind) {
-      fprintf(out, "%s↓%d", wrote ? " " : "", git_map.behind);
-    }
-    fprintf(out, "]");
+    if (git_map.behind)
+      APPEND("%s↓%d", wrote ? " " : "", git_map.behind);
+    APPEND("]");
   }
   if (git_map.head_hash[0])
-    fprintf(out, " · %s %s", git_map.head_hash, git_map.head_subject);
-  fprintf(out, "\n");
+    APPEND(" · %s %s", git_map.head_hash, git_map.head_subject);
+#undef APPEND
+
+  int dw = display_width(buf);
+  if (dw > term_w && term_w >= 3) {
+    int n = bytes_for_display_cols(buf, term_w - 3);
+    fprintf(out, "%.*s...\n", n, buf);
+  } else {
+    fprintf(out, "%s\n", buf);
+  }
 }
 
 static void print_git_footer(FILE *out) {
@@ -1358,6 +1378,8 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
   /*
    * Cap w_col_b to available budget in the active layout. col_b can
    * hold "-> <symlink>" which is unbounded and would otherwise wrap.
+   * On terms too narrow even for "..." (budget < 4), drop col_b
+   * entirely — forcing a 4-col floor would push every row past term_w.
    */
   if (w_col_b > 0) {
     int prefix;
@@ -1369,8 +1391,8 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
     }
     int budget = term_w - prefix - meta_fixed - 2; /* 2 = col_b separator */
     if (budget < 4)
-      budget = 4;
-    if (w_col_b > budget)
+      w_col_b = 0;
+    else if (w_col_b > budget)
       w_col_b = budget;
   }
 
@@ -1392,7 +1414,7 @@ static void print_pretty(const rowlist_t *rl, const options_t *opts) {
   }
 
   if (opts->show_git)
-    print_git_banner(out);
+    print_git_banner(out, term_w);
 
   /* print */
   int tree_continues[MAX_DEPTH] = {0};
